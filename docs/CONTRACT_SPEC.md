@@ -266,6 +266,14 @@ There is no dynamic or user-controlled storage key.
 Both thresholds are `100_000` ledgers and extend to `518_400` ledgers (~30 days at
 5-second ledgers). Extension is best-effort and never gates an entry point's success.
 
+Membership and payout-order entries are written once, at `join`, so they are also refreshed
+where later rounds use them: `contribute` extends the contributor's `Member` entry and the
+current round's `MemberAt` slot, and `execute_payout` extends the paid recipient's
+`MemberAt` and `Member` entries plus the **next** round's `MemberAt` slot (a no-op after the
+final round, where no such slot exists). A group that outlives one persistent window therefore
+keeps the entries its next round depends on. Restoring an entry that has already been archived
+is a network operation, not something the contract can do for itself.
+
 ## Events
 
 All events use the `["susu", "<name>"]` topic prefix so the indexer can key on them

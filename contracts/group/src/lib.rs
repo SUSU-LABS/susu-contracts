@@ -530,6 +530,11 @@ impl GroupContract {
         extend_persistent_ttl(&env, &contribution_key);
         extend_persistent_ttl(&env, &DataKey::RoundPool(round));
         extend_persistent_ttl(&env, &count_key);
+        // Membership and payout order are written once, at join. Refresh them on
+        // use so a group that outlives one persistent window does not archive the
+        // very entries its later rounds depend on.
+        extend_persistent_ttl(&env, &DataKey::Member(member.clone()));
+        extend_persistent_ttl_if_present(&env, &DataKey::MemberAt(round));
 
         // Interaction last.
         token::Client::new(&env, &config.token).transfer(
@@ -603,6 +608,13 @@ impl GroupContract {
         // pointer so a re-entrant token cannot pay the same round twice.
         persistent.set(&DataKey::PayoutExecuted(round), &true);
         extend_persistent_ttl(&env, &DataKey::PayoutExecuted(round));
+        // Keep the payout order alive across rounds: refresh this recipient's slot
+        // and membership entry, and the next recipient's slot, which is the entry
+        // the following payout cannot proceed without. There is no next slot after
+        // the final round, so that refresh must be a no-op there.
+        extend_persistent_ttl(&env, &DataKey::MemberAt(round));
+        extend_persistent_ttl_if_present(&env, &DataKey::Member(recipient.clone()));
+        extend_persistent_ttl_if_present(&env, &DataKey::MemberAt(round + 1));
 
         let is_final_round = round >= config.member_capacity;
         if is_final_round {
@@ -859,6 +871,14 @@ fn extend_persistent_ttl(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+/// As `extend_persistent_ttl`, but a no-op when the entry does not exist (for
+/// example the slot after the final round), so a refresh can never trap a call.
+fn extend_persistent_ttl_if_present(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        extend_persistent_ttl(env, key);
+    }
 }
 
 mod test;

@@ -12,7 +12,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{storage::Persistent as _, Address as _, Events as _, Ledger as _},
     token, Event, Vec,
 };
 
@@ -920,6 +920,90 @@ fn ttl_is_extended_by_an_interaction() {
         ttl > INSTANCE_TTL_THRESHOLD,
         "instance TTL must be extended so an active group never archives (ttl={ttl})"
     );
+}
+
+/// Ledgers between rounds in the lifecycle tests below: just under the 518_400
+/// ledger (~30 day) persistent window, i.e. a group that runs one round a month.
+const MONTHLY_GAP_LEDGERS: u32 = 500_000;
+
+fn advance_ledgers(env: &Env, ledgers: u32) {
+    env.ledger()
+        .with_mut(|info| info.sequence_number += ledgers);
+}
+
+fn persistent_ttl(setup: &Setup, key: &DataKey) -> u32 {
+    setup.env.as_contract(&setup.group_id, || {
+        setup.env.storage().persistent().get_ttl(key)
+    })
+}
+
+#[test]
+fn a_monthly_group_keeps_its_members_and_payout_order_for_its_whole_life() {
+    // End-to-end lifecycle with a ~30 day gap before every round. The unit test
+    // environment does not enforce archival, so the TTL assertions in the test
+    // below are what pin the behaviour; this one proves the refresh calls never
+    // break a full multi-round payout.
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    setup.join_all();
+    setup.client().start();
+
+    let mut round = 1;
+    while round <= setup.capacity {
+        advance_ledgers(&setup.env, MONTHLY_GAP_LEDGERS);
+        setup.contribute_all(round);
+        setup.client().execute_payout();
+        round += 1;
+    }
+
+    assert_eq!(setup.client().get_group().status, Status::Completed);
+    // Everyone paid 30 USDC in and received the 29.85 USDC net pool exactly once.
+    let expected = 40 * ONE_USDC - 30 * ONE_USDC + 298_500_000;
+    let mut index = 0;
+    while index < setup.capacity {
+        assert_eq!(setup.token_client().balance(&setup.member(index)), expected);
+        index += 1;
+    }
+}
+
+#[test]
+fn contribute_and_payout_refresh_the_persistent_keys_later_rounds_depend_on() {
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    setup.join_all();
+    setup.client().start();
+    advance_ledgers(&setup.env, MONTHLY_GAP_LEDGERS);
+
+    // The join-time entries are now inside the extension threshold.
+    assert!(persistent_ttl(&setup, &DataKey::Member(setup.member(0))) < PERSISTENT_TTL_THRESHOLD);
+
+    setup.contribute_all(1);
+    let mut index = 0;
+    while index < setup.capacity {
+        let ttl = persistent_ttl(&setup, &DataKey::Member(setup.member(index)));
+        assert!(
+            ttl >= PERSISTENT_TTL_EXTEND_TO - 1,
+            "contribute must refresh the contributor's Member entry (ttl={ttl})"
+        );
+        index += 1;
+    }
+
+    setup.client().execute_payout();
+    // The paid recipient and the next recipient must both outlive the next round.
+    for position in [1u32, 2u32] {
+        let ttl = persistent_ttl(&setup, &DataKey::MemberAt(position));
+        assert!(
+            ttl >= PERSISTENT_TTL_EXTEND_TO - 1,
+            "execute_payout must refresh MemberAt({position}) (ttl={ttl})"
+        );
+    }
+}
+
+#[test]
+fn the_final_payout_does_not_look_for_a_round_after_the_last() {
+    // `MemberAt(capacity + 1)` never exists; refreshing "the next recipient" on the
+    // last round must be a no-op, not a trap that would block the final payout.
+    let setup = setup(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    setup.run_to_completion();
+    assert_eq!(setup.client().get_group().status, Status::Completed);
 }
 
 #[test]
