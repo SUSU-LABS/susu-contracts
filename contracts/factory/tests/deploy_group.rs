@@ -180,6 +180,9 @@ fn a_deployed_group_runs_a_full_cycle() {
         token: harness.token.clone(),
         contribution_amount: 10 * ONE_USDC,
         member_capacity: 3,
+        fee_bps: 50,
+        treasury: harness.treasury.clone(),
+        frequency_seconds: ONE_WEEK,
     }
     .to_xdr(&harness.env, &harness.factory_id);
     assert!(created_events.events().contains(&expected));

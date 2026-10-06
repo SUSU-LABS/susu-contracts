@@ -108,6 +108,9 @@ pub struct GroupCreated {
     pub token: Address,
     pub contribution_amount: i128,
     pub member_capacity: u32,
+    pub fee_bps: u32,
+    pub treasury: Address,
+    pub frequency_seconds: u64,
 }
 
 /// The protocol fee applied to newly created groups changed.
@@ -243,6 +246,9 @@ impl FactoryContract {
             token,
             contribution_amount,
             member_capacity,
+            fee_bps: config.fee_bps,
+            treasury: config.treasury,
+            frequency_seconds,
         }
         .publish(&env);
 
