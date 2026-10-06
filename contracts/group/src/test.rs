@@ -973,3 +973,543 @@ fn pool_balance_ignores_stray_transfers() {
         "stray funds cannot trigger or inflate a payout"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reentrancy resistance against malicious/adversarial tokens
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttackType {
+    None,
+    ReenterContribute,
+    ReenterPayout,
+    ReenterBoth,
+    PanicOnContributeReentrancy,
+}
+
+#[contracttype]
+pub enum MaliciousKey {
+    Balance(Address),
+    TargetGroup,
+    Attack,
+    Attempts,
+    ReentrancyAborted,
+    Successes,
+    InCallback,
+}
+
+#[contract]
+pub struct MaliciousToken;
+
+#[contractimpl]
+impl MaliciousToken {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let key = MaliciousKey::Balance(to);
+        let bal: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        env.storage().instance().set(&key, &(bal + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        let key = MaliciousKey::Balance(id);
+        env.storage().instance().get(&key).unwrap_or(0)
+    }
+
+    pub fn set_target_group(env: Env, target_group: Address) {
+        env.storage()
+            .instance()
+            .set(&MaliciousKey::TargetGroup, &target_group);
+    }
+
+    pub fn set_attack(env: Env, attack: AttackType) {
+        env.storage().instance().set(&MaliciousKey::Attack, &attack);
+    }
+
+    pub fn get_attempts(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&MaliciousKey::Attempts)
+            .unwrap_or(0)
+    }
+
+    pub fn get_reentrancy_aborted(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&MaliciousKey::ReentrancyAborted)
+            .unwrap_or(0)
+    }
+
+    pub fn get_successes(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&MaliciousKey::Successes)
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        if amount < 0 {
+            panic!("amount cannot be negative");
+        }
+        let from_key = MaliciousKey::Balance(from.clone());
+        let to_key = MaliciousKey::Balance(to.clone());
+
+        let from_balance: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
+        let to_balance: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+        if from_balance < amount {
+            panic!("insufficient balance");
+        }
+
+        env.storage()
+            .instance()
+            .set(&from_key, &(from_balance - amount));
+        env.storage()
+            .instance()
+            .set(&to_key, &(to_balance + amount));
+
+        let in_callback: bool = env
+            .storage()
+            .instance()
+            .get(&MaliciousKey::InCallback)
+            .unwrap_or(false);
+        if !in_callback {
+            let attack: AttackType = env
+                .storage()
+                .instance()
+                .get(&MaliciousKey::Attack)
+                .unwrap_or(AttackType::None);
+            if let Some(target_group) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&MaliciousKey::TargetGroup)
+            {
+                let group_client = GroupContractClient::new(&env, &target_group);
+                let should_attack_contribute = matches!(
+                    attack,
+                    AttackType::ReenterContribute
+                        | AttackType::ReenterBoth
+                        | AttackType::PanicOnContributeReentrancy
+                ) && to == target_group;
+
+                let should_attack_payout =
+                    matches!(attack, AttackType::ReenterPayout | AttackType::ReenterBoth)
+                        && from == target_group;
+
+                if should_attack_contribute {
+                    env.storage()
+                        .instance()
+                        .set(&MaliciousKey::InCallback, &true);
+                    let attempts: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&MaliciousKey::Attempts)
+                        .unwrap_or(0);
+                    env.storage()
+                        .instance()
+                        .set(&MaliciousKey::Attempts, &(attempts + 1));
+
+                    if attack == AttackType::PanicOnContributeReentrancy {
+                        group_client.contribute(&from, &amount, &1u32);
+                    } else {
+                        let res = group_client.try_contribute(&from, &amount, &1u32);
+                        if res.is_err() {
+                            let r: u32 = env
+                                .storage()
+                                .instance()
+                                .get(&MaliciousKey::ReentrancyAborted)
+                                .unwrap_or(0);
+                            env.storage()
+                                .instance()
+                                .set(&MaliciousKey::ReentrancyAborted, &(r + 1));
+                        } else {
+                            let s: u32 = env
+                                .storage()
+                                .instance()
+                                .get(&MaliciousKey::Successes)
+                                .unwrap_or(0);
+                            env.storage()
+                                .instance()
+                                .set(&MaliciousKey::Successes, &(s + 1));
+                        }
+                    }
+                    env.storage()
+                        .instance()
+                        .set(&MaliciousKey::InCallback, &false);
+                } else if should_attack_payout {
+                    env.storage()
+                        .instance()
+                        .set(&MaliciousKey::InCallback, &true);
+                    let attempts: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&MaliciousKey::Attempts)
+                        .unwrap_or(0);
+                    env.storage()
+                        .instance()
+                        .set(&MaliciousKey::Attempts, &(attempts + 1));
+
+                    let res = group_client.try_execute_payout();
+                    if res.is_err() {
+                        let r: u32 = env
+                            .storage()
+                            .instance()
+                            .get(&MaliciousKey::ReentrancyAborted)
+                            .unwrap_or(0);
+                        env.storage()
+                            .instance()
+                            .set(&MaliciousKey::ReentrancyAborted, &(r + 1));
+                    } else {
+                        let s: u32 = env
+                            .storage()
+                            .instance()
+                            .get(&MaliciousKey::Successes)
+                            .unwrap_or(0);
+                        env.storage()
+                            .instance()
+                            .set(&MaliciousKey::Successes, &(s + 1));
+                    }
+                    env.storage()
+                        .instance()
+                        .set(&MaliciousKey::InCallback, &false);
+                }
+            }
+        }
+    }
+}
+
+/// Test fixture using the test-only MaliciousToken to verify reentrancy defense.
+struct MaliciousSetup {
+    env: Env,
+    group_id: Address,
+    token: Address,
+    treasury: Address,
+    members: Vec<Address>,
+    amount: i128,
+    capacity: u32,
+}
+
+impl MaliciousSetup {
+    fn client(&self) -> GroupContractClient<'_> {
+        GroupContractClient::new(&self.env, &self.group_id)
+    }
+
+    fn member(&self, index: u32) -> Address {
+        self.members.get(index).unwrap()
+    }
+
+    fn token_client(&self) -> MaliciousTokenClient<'_> {
+        MaliciousTokenClient::new(&self.env, &self.token)
+    }
+
+    fn join_all(&self) {
+        let client = self.client();
+        let mut index = 0;
+        while index < self.capacity {
+            client.join(&self.member(index));
+            index += 1;
+        }
+    }
+
+    fn contribute_all(&self, round: u32) {
+        let client = self.client();
+        let mut index = 0;
+        while index < self.capacity {
+            client.contribute(&self.member(index), &self.amount, &round);
+            index += 1;
+        }
+    }
+}
+
+fn setup_malicious(capacity: u32, amount: i128, fee_bps: u32) -> MaliciousSetup {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let treasury = Address::generate(&env);
+    let token = env.register(MaliciousToken, ());
+
+    let group_id = env.register(
+        GroupContract,
+        (
+            Address::generate(&env), // factory (informational)
+            Address::generate(&env), // creator (informational, no authority)
+            token.clone(),
+            treasury.clone(),
+            amount,
+            capacity,
+            ONE_WEEK,
+            fee_bps,
+        ),
+    );
+
+    let mal_client = MaliciousTokenClient::new(&env, &token);
+    mal_client.set_target_group(&group_id);
+
+    let mut members = Vec::new(&env);
+    let mut index = 0;
+    while index < capacity {
+        let member = Address::generate(&env);
+        mal_client.mint(&member, &(amount * (capacity as i128 + 1)));
+        members.push_back(member);
+        index += 1;
+    }
+
+    MaliciousSetup {
+        env,
+        group_id,
+        token,
+        treasury,
+        members,
+        amount,
+        capacity,
+    }
+}
+
+#[test]
+fn reentrant_token_cannot_duplicate_contribution() {
+    let setup = setup_malicious(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    let token_client = setup.token_client();
+
+    setup.join_all();
+    client.start();
+
+    // Enable reentrancy attack on contribute
+    token_client.set_attack(&AttackType::ReenterContribute);
+
+    let member_0 = setup.member(0);
+    let start_bal_0 = token_client.balance(&member_0);
+
+    // Member 0 contributes. During the token transfer hook, MaliciousToken re-enters
+    // contribute for member_0 in round 1.
+    client.contribute(&member_0, &setup.amount, &1u32);
+
+    // The reentrant call was attempted and aborted (reentrancy disallowed)
+    assert_eq!(token_client.get_attempts(), 1);
+    assert_eq!(token_client.get_reentrancy_aborted(), 1);
+    assert_eq!(token_client.get_successes(), 0);
+
+    // Invariant: Exactly one contribution recorded in state and pool balance
+    let round_info = client.get_round(&1u32);
+    assert_eq!(round_info.contribution_count, 1);
+    assert_eq!(round_info.pool, setup.amount);
+    assert_eq!(client.get_pool_balance(), setup.amount);
+
+    // Balance checks: Member 0 deducted exactly once, Group received exactly once
+    assert_eq!(
+        token_client.balance(&member_0),
+        start_bal_0 - setup.amount,
+        "member must not be charged twice"
+    );
+    assert_eq!(
+        token_client.balance(&setup.group_id),
+        setup.amount,
+        "group balance must reflect exactly one contribution"
+    );
+
+    // Other members contribute under the same active reentrancy attack
+    client.contribute(&setup.member(1), &setup.amount, &1u32);
+    client.contribute(&setup.member(2), &setup.amount, &1u32);
+
+    assert_eq!(token_client.get_attempts(), 3);
+    assert_eq!(token_client.get_reentrancy_aborted(), 3);
+    assert_eq!(token_client.get_successes(), 0);
+
+    // Round is fully funded with exactly 3 contributions
+    let completed_round = client.get_round(&1u32);
+    assert_eq!(completed_round.contribution_count, 3);
+    assert_eq!(completed_round.pool, 3 * setup.amount);
+    assert_eq!(client.get_pool_balance(), 3 * setup.amount);
+    assert_eq!(token_client.balance(&setup.group_id), 3 * setup.amount);
+}
+
+#[test]
+fn reentrant_token_cannot_duplicate_payout() {
+    let setup = setup_malicious(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    let token_client = setup.token_client();
+
+    setup.join_all();
+    client.start();
+    setup.contribute_all(1);
+
+    // At round 1 ready for payout: pool is 30 USDC (300_000_000 stroops).
+    // Fee is 50 bps = 1_500_000 stroops (0.15 USDC). Recipient amount is 298_500_000 stroops (29.85 USDC).
+    let recipient = setup.member(0);
+    let start_bal_recipient = token_client.balance(&recipient);
+    assert_eq!(token_client.balance(&setup.treasury), 0);
+    assert_eq!(token_client.balance(&setup.group_id), 30 * ONE_USDC);
+
+    // Arm reentrant payout attack
+    token_client.set_attack(&AttackType::ReenterPayout);
+
+    // Execute payout. Two transfers happen: fee to treasury, net amount to recipient.
+    // On both transfers, the malicious token attempts to re-enter execute_payout().
+    client.execute_payout();
+
+    // Both reentrancy attempts were rejected because CEI advanced the round pointer
+    // and reset the phase to WaitingForContributions before transfers occurred.
+    assert_eq!(token_client.get_attempts(), 2);
+    assert_eq!(token_client.get_reentrancy_aborted(), 2);
+    assert_eq!(token_client.get_successes(), 0);
+
+    // State invariant: Round 1 is marked paid, current round advanced to 2
+    assert!(client.get_round(&1u32).payout_executed);
+    assert_eq!(client.get_current_round(), 2);
+
+    // Financial balance invariant: exactly one fee and one payout transferred
+    let expected_fee = 30 * ONE_USDC * (MAX_FEE_BPS as i128) / 10_000;
+    let expected_net = 30 * ONE_USDC - expected_fee;
+
+    assert_eq!(
+        token_client.balance(&setup.treasury),
+        expected_fee,
+        "treasury must receive exactly one fee"
+    );
+    assert_eq!(
+        token_client.balance(&recipient),
+        start_bal_recipient + expected_net,
+        "recipient must receive exactly one payout"
+    );
+    assert_eq!(
+        token_client.balance(&setup.group_id),
+        0,
+        "group contract must retain nothing after payout"
+    );
+
+    // Directly calling execute_payout again is also rejected
+    assert_eq!(
+        client.try_execute_payout(),
+        Err(Ok(GroupError::ContributionsIncomplete)),
+        "further payout attempts cannot execute until next round is funded"
+    );
+}
+
+#[test]
+fn reentrant_token_cannot_duplicate_final_round_payout() {
+    let setup = setup_malicious(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    let token_client = setup.token_client();
+
+    setup.join_all();
+    client.start();
+
+    // Round 1 completes cleanly
+    setup.contribute_all(1);
+    client.execute_payout();
+
+    // Round 2 (final round): contribute all
+    setup.contribute_all(2);
+
+    // Arm reentrant payout attack for final round
+    token_client.set_attack(&AttackType::ReenterPayout);
+
+    let recipient_r2 = setup.member(1);
+    let start_bal_r2 = token_client.balance(&recipient_r2);
+    let start_bal_treasury = token_client.balance(&setup.treasury);
+
+    client.execute_payout();
+
+    // Reentrancy in final round is rejected because reentrancy is disallowed and
+    // CEI set Status to Completed before interactions.
+    assert_eq!(token_client.get_attempts(), 2);
+    assert_eq!(token_client.get_reentrancy_aborted(), 2);
+    assert_eq!(token_client.get_successes(), 0);
+
+    assert_eq!(client.get_status(), Status::Completed);
+    assert_eq!(token_client.balance(&setup.group_id), 0);
+
+    let expected_fee = 20 * ONE_USDC * (MAX_FEE_BPS as i128) / 10_000;
+    let expected_net = 20 * ONE_USDC - expected_fee;
+
+    assert_eq!(
+        token_client.balance(&setup.treasury),
+        start_bal_treasury + expected_fee
+    );
+    assert_eq!(
+        token_client.balance(&recipient_r2),
+        start_bal_r2 + expected_net
+    );
+
+    // Status is Completed, so future payout attempts are refused
+    assert_eq!(
+        client.try_execute_payout(),
+        Err(Ok(GroupError::GroupCompleted))
+    );
+}
+
+#[test]
+fn unhandled_reentrant_contribute_reverts_whole_transaction() {
+    let setup = setup_malicious(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    let token_client = setup.token_client();
+
+    setup.join_all();
+    client.start();
+
+    let member_0 = setup.member(0);
+    let start_bal = token_client.balance(&member_0);
+
+    // Attack that panics when the reentrant call fails
+    token_client.set_attack(&AttackType::PanicOnContributeReentrancy);
+
+    // The contribution must fail / revert because the reentrancy panicked
+    assert!(client
+        .try_contribute(&member_0, &setup.amount, &1u32)
+        .is_err());
+
+    // State and balances are completely unmutated because transaction reverted
+    assert_eq!(client.get_pool_balance(), 0);
+    assert_eq!(client.get_round(&1u32).contribution_count, 0);
+    assert_eq!(token_client.balance(&setup.group_id), 0);
+    assert_eq!(token_client.balance(&member_0), start_bal);
+}
+
+#[test]
+fn financial_e2e_under_continuous_reentrancy_attack() {
+    let setup = setup_malicious(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    let token_client = setup.token_client();
+
+    let start_balances: Vec<i128> = {
+        let mut balances = Vec::new(&setup.env);
+        let mut index = 0;
+        while index < 3 {
+            balances.push_back(token_client.balance(&setup.member(index)));
+            index += 1;
+        }
+        balances
+    };
+
+    setup.join_all();
+    client.start();
+
+    // Continuous reentrancy: attack on EVERY contribute and EVERY payout transfer
+    token_client.set_attack(&AttackType::ReenterBoth);
+
+    let mut round = 1;
+    while round <= 3 {
+        setup.contribute_all(round);
+        client.execute_payout();
+        round += 1;
+    }
+
+    // Zero reentrancy attacks succeeded across all 3 rounds
+    assert_eq!(token_client.get_successes(), 0);
+    assert!(token_client.get_attempts() > 0);
+    assert_eq!(client.get_status(), Status::Completed);
+
+    // Exactly 3 contributions per member, exactly 1 payout received per member
+    let mut index = 0;
+    while index < 3 {
+        let expected = start_balances.get(index).unwrap() - 30 * ONE_USDC + 298_500_000;
+        assert_eq!(
+            token_client.balance(&setup.member(index)),
+            expected,
+            "member {index} must have exactly three contributions and one payout"
+        );
+        index += 1;
+    }
+
+    // Protocol treasury received exactly 3 round fees, group retains 0
+    assert_eq!(token_client.balance(&setup.treasury), 3 * 1_500_000);
+    assert_eq!(token_client.balance(&setup.group_id), 0);
+}
