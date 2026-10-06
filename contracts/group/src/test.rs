@@ -183,6 +183,62 @@ fn constructor_rejects_non_positive_contribution_amount() {
 
 #[test]
 #[should_panic]
+fn constructor_rejects_a_pooled_total_that_cannot_fit() {
+    // The smallest amount above the ceiling for the smallest group: the pair
+    // (i128::MAX / 2 + 1, 2) overflows by exactly one. The last `checked_add`
+    // in `contribute` would always fail, so the round could never become
+    // `ReadyForPayout` and the first member's deposit would be locked forever.
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX / 2 + 1,
+            2u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+fn constructor_accepts_the_largest_poolable_pair() {
+    // The boundary pair itself still pools: (i128::MAX / 2) * 2 == i128::MAX - 1
+    // fits, so a group configured at the ceiling remains constructible.
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let group_id = env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token.clone(),
+            Address::generate(&env),
+            i128::MAX / 2,
+            2u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+    let client = GroupContractClient::new(&env, &group_id);
+    let state = client.get_group();
+    assert_eq!(state.config.contribution_amount, i128::MAX / 2);
+    assert_eq!(state.config.member_capacity, 2);
+    assert_eq!(state.status, Status::Open);
+}
+
+#[test]
+#[should_panic]
 fn constructor_rejects_zero_member_capacity() {
     let env = Env::default();
     env.mock_all_auths();

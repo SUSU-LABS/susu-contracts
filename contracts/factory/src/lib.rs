@@ -202,6 +202,17 @@ impl FactoryContract {
         if frequency_seconds == 0 {
             return Err(FactoryError::InvalidFrequency);
         }
+        // The pooled total (contribution_amount * member_capacity) must fit in
+        // i128: the group's round pool accumulates with `checked_add`, and a
+        // pair that cannot pool would strand the first deposits in a round that
+        // can never complete. The Group enforces the same ceiling in its own
+        // constructor, mirroring the shared fee rule.
+        if contribution_amount
+            .checked_mul(i128::from(member_capacity))
+            .is_none()
+        {
+            return Err(FactoryError::InvalidContributionAmount);
+        }
 
         let group_id = match storage.get::<DataKey, u32>(&DataKey::GroupCount) {
             Some(count) => match count.checked_add(1) {

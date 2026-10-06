@@ -358,6 +358,19 @@ impl GroupContract {
         if fee_bps == 0 || fee_bps > MAX_FEE_BPS {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidFeeBps);
         }
+        // Pooled ceiling. Every member contributes `contribution_amount` into
+        // the same round pool, which `contribute` accumulates with
+        // `checked_add`. A pair whose pooled total cannot fit in i128 lets the
+        // first contribution succeed and makes every later one return
+        // `ArithmeticOverflow`, so the round can never reach
+        // `ReadyForPayout` -- and with no withdrawal path, the earlier deposits
+        // are locked forever. Reject it before any state is written.
+        if contribution_amount
+            .checked_mul(i128::from(member_capacity))
+            .is_none()
+        {
+            soroban_sdk::panic_with_error!(&env, GroupError::InvalidContributionAmount);
+        }
 
         let config = GroupConfig {
             factory,
