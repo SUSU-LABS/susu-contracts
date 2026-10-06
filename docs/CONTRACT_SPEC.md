@@ -276,10 +276,16 @@ to filter by them.
 
 | Event | Topics | Data |
 |---|---|---|
-| `GroupCreated` | `susu`, `group_created`, `creator`, `group` | `group_id`, `token`, `contribution_amount`, `member_capacity` |
+| `GroupCreated` | `susu`, `group_created`, `creator`, `group` | `group_id`, `token`, `contribution_amount`, `member_capacity`, `fee_bps`, `treasury`, `frequency_seconds` |
 | `FeeUpdated` | `susu`, `fee_updated` | `fee_bps` |
 | `TreasuryUpdated` | `susu`, `treasury_updated`, `treasury` | — |
 | `PauseUpdated` | `susu`, `pause_updated` | `paused` |
+
+`GroupCreated` records the fee, treasury, and frequency frozen into the new Group at
+construction. These are data fields; the existing four topics remain unchanged.
+Later Factory configuration changes apply only to future groups, so indexers should
+read the creation event's terms rather than infer historical terms from current
+Factory configuration. Older creation events do not carry these additional fields.
 
 **Group**
 
