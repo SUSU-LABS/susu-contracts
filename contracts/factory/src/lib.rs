@@ -82,7 +82,7 @@ pub enum DataKey {
 pub enum FactoryError {
     /// Fee exceeds `MAX_FEE_BPS`, or is zero.
     InvalidFeeBps = 1,
-    /// Contribution amount is zero or less.
+    /// Contribution amount is zero or less, or pooled arithmetic would overflow.
     InvalidContributionAmount = 2,
     /// Member capacity is outside `[MIN_MEMBERS, MAX_MEMBERS]`.
     InvalidMemberCapacity = 3,
@@ -193,7 +193,11 @@ impl FactoryContract {
         if config.paused {
             return Err(FactoryError::Paused);
         }
-        if contribution_amount <= 0 {
+        if contribution_amount <= 0
+            || contribution_amount
+                .checked_mul(member_capacity as i128)
+                .is_none()
+        {
             return Err(FactoryError::InvalidContributionAmount);
         }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {

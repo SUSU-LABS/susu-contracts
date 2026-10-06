@@ -75,7 +75,8 @@ receives fees, and the fee in basis points.
 Sets the immutable group configuration. Called by the Factory during `create_group`,
 but deployable by anyone — a group carries no privileges over the Factory.
 
-- Rejects `contribution_amount <= 0`, capacity outside `[2, 100]`, `fee_bps` outside
+- Rejects `contribution_amount <= 0` or overflowing pooled arithmetic
+  (`contribution_amount * member_capacity > i128::MAX`), capacity outside `[2, 100]`, `fee_bps` outside
   `(0, 50]`, and `frequency_seconds == 0`.
 - `factory` and `creator` are informational and carry **no authority**.
 

@@ -183,6 +183,80 @@ fn constructor_rejects_non_positive_contribution_amount() {
 
 #[test]
 #[should_panic]
+fn constructor_rejects_overflowing_pooled_contribution_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            2u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
+fn constructor_rejects_pooled_contribution_amount_overflowing_by_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            (i128::MAX / 2) + 1,
+            2u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+fn constructor_accepts_valid_boundary_pooled_contribution_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let max_valid_amount = i128::MAX / 2;
+    let group_id = env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            max_valid_amount,
+            2u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+    let client = GroupContractClient::new(&env, &group_id);
+    assert_eq!(
+        client.get_group().config.contribution_amount,
+        max_valid_amount
+    );
+}
+
+#[test]
+#[should_panic]
 fn constructor_rejects_zero_member_capacity() {
     let env = Env::default();
     env.mock_all_auths();

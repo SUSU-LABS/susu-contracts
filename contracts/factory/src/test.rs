@@ -229,6 +229,14 @@ fn create_group_rejects_invalid_parameters() {
         Err(Ok(FactoryError::InvalidContributionAmount))
     );
     assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &2u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidContributionAmount))
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &((i128::MAX / 2) + 1), &2u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidContributionAmount))
+    );
+    assert_eq!(
         client.try_create_group(&creator, &token, &10_000_000i128, &0u32, &604_800u64),
         Err(Ok(FactoryError::InvalidMemberCapacity))
     );
