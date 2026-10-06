@@ -862,3 +862,4 @@ fn extend_persistent_ttl(env: &Env, key: &DataKey) {
 }
 
 mod test;
+mod test_reentrancy;
