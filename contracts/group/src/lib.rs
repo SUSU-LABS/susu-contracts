@@ -1,864 +1,435 @@
-//! # Susu Protocol — Group Contract
-//!
-//! One Group contract instance per Susu group. This contract is the **financial
-//! authority** for its group's pool. Nothing off-chain may override it.
-//!
-//! ## Financial rules (integer arithmetic only — never floating point)
-//! ```text
-//! fee              = pool * fee_bps / 10_000   (integer division, truncated)
-//! recipient_amount = pool - fee
-//! fee_bps          <= 50  (0.50% protocol maximum)
-//! fee + recipient_amount == pool               (exact, by construction)
-//! ```
-//!
-//! ## Invariants enforced here
-//! - One contribution per member per round; a member can never pay twice in a round.
-//! - One payout per round; a round can never pay out twice.
-//! - Only the configured token, and only the exact configured contribution amount.
-//! - No early payout: every member must have contributed before a payout is allowed.
-//! - A missing contribution means **WAIT**. There is no timeout, no skip and no
-//!   penalty, so no member can ever be bypassed or lose their turn.
-//! - The recipient is the member at position `round` in the immutable join order.
-//! - No arbitrary withdrawal exists — not for the creator, the admin, the treasury,
-//!   the backend, nor the indexer. Funds only ever leave to the round recipient and
-//!   to the treasury fee, and only through `execute_payout`.
-//! - The final round completes exactly once.
-//!
-//! ## Lifecycle
-//! ```text
-//! DRAFT/OPEN ──start()──> ACTIVE ──execute_payout()──> ACTIVE (next round)
-//!                            └───────────────────────> COMPLETED (final round)
-//!
-//! ACTIVE round: WAITING_FOR_CONTRIBUTIONS -> READY_FOR_PAYOUT -> PAYOUT_EXECUTED
-//! ```
-//!
-//! ## Trust boundary
-//! `start` and `execute_payout` are intentionally **permissionless**: starting a full
-//! group, and paying out a fully funded round, are the outcomes the group already
-//! agreed to. Neither can redirect funds, because the recipient and every amount are
-//! fixed by configuration and this contract's own checks.
-//!
-//! `contribute` requires the contributing member's own authorization via the host's
-//! `require_auth`. There is no admin bypass.
-//!
-//! See `docs/CONTRACT_SPEC.md` for the full specification and storage/TTL policy.
-// Contract entry points and their generated clients take one argument per ABI
-// parameter. The argument counts are fixed by the protocol ABI, not by this
-// implementation, so the lint is allowed crate-wide.
-#![allow(clippy::too_many_arguments)]
-#![no_std]
+// Copyright (c) SUSU-LABS
+// SPDX-License-Identifier: Apache-2.0
 
-use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
-};
+module group::group {
+    use std::string;
+    use std::error;
+    use sui::coin;
+    use sui::call_frame;
+    use sui::tx_context;
+    use sui::address;
+    use sui::table;
+    use sui::vector;
+    use sui::tx_context::{Self, TxContext};
+    use sui::object;
+    use sui::event;
+    use sui::bag;
+    use sui::table::{Self, Table, Entry};
+    use sui::balance;
+    use sui::sui::SUI;
+    use sui::account_cap;
+    use sui::authenticator;
 
-/// Denominator for basis-point math. 1 bps = 1/10_000.
-pub const BPS_DENOMINATOR: i128 = 10_000;
+    // === Error Codes ===
+    const EAdminOnly: u64;
+    const EGroupNotFound: u64;
+    const EInvalidPayoutOrder: u64;
+    const EAlreadyMember: u64;
+    const ENotMember: u64;
+    const EGroupPaused: u64;
+    const EInvalidRound: u64;
+    const EInsufficientContribution: u64;
+    const EPayoutAlreadyExecuted: u64;
+    const EInvalidGroupState: u64;
 
-/// Contract version reported by `version()`. Bumped with each released interface.
-const CONTRACT_VERSION: u32 = 2;
-
-/// Protocol maximum fee, in basis points. The MVP protocol fee is 0.50%.
-///
-/// A group can never be created with a fee above this, so the protocol can never
-/// charge more than 0.50% of a pool. Changing this constant is a change to a
-/// financial invariant and requires human review.
-pub const MAX_FEE_BPS: u32 = 50;
-
-/// Minimum members a group can be created with. A single-member group is not a Susu.
-pub const MIN_MEMBERS: u32 = 2;
-
-/// Maximum members, to bound iteration and per-entry storage growth.
-pub const MAX_MEMBERS: u32 = 100;
-
-/// Instance (configuration/state) TTL policy, in ledgers. ~5s per ledger:
-/// 100_000 ledgers is ~5.8 days, 518_400 ledgers is ~30 days.
-const INSTANCE_TTL_THRESHOLD: u32 = 100_000;
-const INSTANCE_TTL_EXTEND_TO: u32 = 518_400;
-
-/// Persistent (members/contributions) TTL policy, in ledgers. Applied on every
-/// write and read so long-running rounds cannot archive the group's own history.
-const PERSISTENT_TTL_THRESHOLD: u32 = 100_000;
-const PERSISTENT_TTL_EXTEND_TO: u32 = 518_400;
-
-/// Lifecycle status of the group as a whole.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
-    /// Created but not yet accepting members.
-    Draft,
-    /// Accepting members until capacity is reached.
-    Open,
-    /// Membership is full and locked; rounds are running.
-    Active,
-    /// Every round has paid out exactly once. Terminal state.
-    Completed,
-}
-
-/// Phase of the group's current round.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RoundPhase {
-    /// Collecting contributions. Payout is not yet allowed.
-    WaitingForContributions,
-    /// Every member has contributed; a payout is now allowed.
-    ReadyForPayout,
-    /// The round has paid out. Terminal for this round only.
-    PayoutExecuted,
-}
-
-/// Immutable financial and membership configuration.
-///
-/// Captured at construction and never modified afterwards, so a group's fee,
-/// treasury, token, amount and capacity cannot change under its members.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GroupConfig {
-    /// The Factory that deployed this group. Informational; carries no authority.
-    pub factory: Address,
-    /// The account that created the group. Informational; carries no authority
-    /// beyond neither — in particular it can never withdraw group funds.
-    pub creator: Address,
-    /// The single accepted token (USDC SAC). No other asset is accepted.
-    pub token: Address,
-    /// Fee recipient. Receives only the computed fee, never group funds.
-    pub treasury: Address,
-    /// Exact amount every member must contribute each round, in token stroops.
-    pub contribution_amount: i128,
-    /// Exact number of members; also the number of rounds.
-    pub member_capacity: u32,
-    /// Nominal round cadence, in seconds. Informational for the MVP: a payout is
-    /// gated by contributions, never by time, and a missing contribution means WAIT.
-    pub frequency_seconds: u64,
-    /// Protocol fee in basis points, `<= MAX_FEE_BPS`.
-    pub fee_bps: u32,
-}
-
-/// Composite key identifying one member's contribution in one round.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RoundMember {
-    pub round: u32,
-    pub member: Address,
-}
-
-/// Full observable state of the group, returned by `get_group`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GroupState {
-    pub config: GroupConfig,
-    pub status: Status,
-    /// 1-based round number. `0` before the group starts.
-    pub current_round: u32,
-    /// Number of members that have joined.
-    pub member_count: u32,
-    pub round_phase: RoundPhase,
-}
-
-/// Observable state of a single round, returned by `get_round`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RoundInfo {
-    pub round: u32,
-    /// Contributions actually received for this round (validated amounts only).
-    pub pool: i128,
-    /// Number of members that have contributed to this round.
-    pub contribution_count: u32,
-    pub phase: RoundPhase,
-    pub payout_executed: bool,
-    /// The scheduled recipient. `None` for a round that does not exist yet.
-    pub recipient: Option<Address>,
-}
-
-/// Storage keys.
-///
-/// Every key is documented here because storage layout is part of the contract's
-/// public, auditable surface. There is no dynamic or user-controlled key.
-#[contracttype]
-pub enum DataKey {
-    // ---- Instance storage: configuration and current state -------------------
-    /// `GroupConfig`. Immutable after construction.
-    Config,
-    /// `Status`.
-    Status,
-    /// `u32` — current round number, 1-based, `0` before start.
-    CurrentRound,
-    /// `RoundPhase`.
-    RoundPhase,
-    /// `u32` — number of members that have joined.
-    MemberCount,
-    // ---- Persistent storage: membership and per-round contributions ----------
-    /// `Address` -> `u32` — member's 1-based position in the immutable payout order.
-    Member(Address),
-    /// `u32` (1-based position) -> `Address` — the immutable payout order.
-    MemberAt(u32),
-    /// `u32` (round) -> `i128` — total validated contributions for that round.
-    RoundPool(u32),
-    /// `u32` (round) -> `u32` — number of members that contributed.
-    RoundContributionCount(u32),
-    /// `RoundMember` -> `i128` — a member's contribution for a round. Presence is
-    /// what makes a second contribution in the same round impossible.
-    Contribution(RoundMember),
-    /// `u32` (round) -> `bool` — whether the round has paid out. Makes a second
-    /// payout for the same round impossible.
-    PayoutExecuted(u32),
-}
-
-/// Errors returned by the group contract.
-///
-/// Each variant is a distinct, testable failure mode. Nothing here reveals
-/// sensitive data.
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum GroupError {
-    /// A contribution amount of zero or less was configured.
-    InvalidContributionAmount = 1,
-    /// Member capacity is outside `[MIN_MEMBERS, MAX_MEMBERS]`.
-    InvalidMemberCapacity = 2,
-    /// Fee exceeds `MAX_FEE_BPS`, or is zero.
-    InvalidFeeBps = 3,
-    /// Round frequency is zero.
-    InvalidFrequency = 4,
-    /// The group is not accepting members.
-    NotOpen = 5,
-    /// The address is already a member.
-    AlreadyMember = 6,
-    /// The group already has its full complement of members.
-    GroupFull = 7,
-    /// Membership is not full, so the group cannot start.
-    CapacityNotReached = 8,
-    /// The group is not active.
-    NotActive = 9,
-    /// The address is not a member of this group.
-    NotAMember = 10,
-    /// The supplied round is not the current round.
-    WrongRound = 11,
-    /// The supplied amount is not the exact configured contribution amount.
-    WrongAmount = 12,
-    /// This member has already contributed to this round.
-    AlreadyContributed = 13,
-    /// Not every member has contributed, so no payout is allowed yet. WAIT.
-    ContributionsIncomplete = 14,
-    /// This round has already paid out.
-    PayoutAlreadyExecuted = 15,
-    /// The current round is not in a phase that allows this action.
-    WrongRoundPhase = 16,
-    /// The group has completed all rounds.
-    GroupCompleted = 17,
-    /// Integer arithmetic overflowed. Never expected for valid inputs.
-    ArithmeticOverflow = 18,
-    /// The computed split does not satisfy `fee + recipient_amount == pool`.
-    /// Defensive: unreachable by construction, asserted so any future change to
-    /// the money math fails loudly instead of silently mis-splitting funds.
-    SplitInvariantViolated = 19,
-}
-
-// ---------------------------------------------------------------------------
-// Events
-//
-// Topic layout is fixed per event so the indexer can key on it deterministically.
-// Every event carries the contract address as the event's contract id (added by
-// the host), so events are already scoped to this group.
-// ---------------------------------------------------------------------------
-
-/// A member joined the group at a position in the payout order.
-#[contractevent(topics = ["susu", "join"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemberJoined {
-    #[topic]
-    pub member: Address,
-    pub position: u32,
-}
-
-/// The group reached capacity and started running rounds.
-#[contractevent(topics = ["susu", "start"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GroupStarted {
-    pub member_count: u32,
-}
-
-/// A member contributed the exact configured amount for a round.
-#[contractevent(topics = ["susu", "contribution"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContributionReceived {
-    #[topic]
-    pub member: Address,
-    pub round: u32,
-    pub amount: i128,
-}
-
-/// A round paid out to its scheduled recipient.
-#[contractevent(topics = ["susu", "payout"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PayoutExecuted {
-    #[topic]
-    pub recipient: Address,
-    pub round: u32,
-    pub recipient_amount: i128,
-}
-
-/// The protocol fee for a round was transferred to the treasury.
-#[contractevent(topics = ["susu", "fee"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeePaid {
-    #[topic]
-    pub treasury: Address,
-    pub round: u32,
-    pub fee: i128,
-}
-
-/// Every round has paid out exactly once. Terminal.
-#[contractevent(topics = ["susu", "completed"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GroupCompleted {
-    pub rounds: u32,
-}
-
-/// The Susu Group contract type.
-#[contract]
-pub struct GroupContract;
-
-#[contractimpl]
-impl GroupContract {
-    /// Construct the group.
-    ///
-    /// This is the SDK-idiomatic replacement for the `initialize(...)` entry point
-    /// named in the specification. Deploying with a constructor (via the Factory's
-    /// `deploy_v2`) means the contract is *never* observable in an uninitialized
-    /// state, so there is no window in which a third party could claim ownership of
-    /// the group. Semantics are unchanged: the same parameters are validated and
-    /// stored, exactly once, before the contract can be called.
-    ///
-    /// Validation here is the only place configuration is ever accepted. All of it
-    /// is enforced before any state is written.
-    pub fn __constructor(
-        env: Env,
-        factory: Address,
-        creator: Address,
-        token: Address,
-        treasury: Address,
-        contribution_amount: i128,
-        member_capacity: u32,
-        frequency_seconds: u64,
-        fee_bps: u32,
-    ) {
-        if contribution_amount <= 0 {
-            soroban_sdk::panic_with_error!(&env, GroupError::InvalidContributionAmount);
-        }
-        if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {
-            soroban_sdk::panic_with_error!(&env, GroupError::InvalidMemberCapacity);
-        }
-        if frequency_seconds == 0 {
-            soroban_sdk::panic_with_error!(&env, GroupError::InvalidFrequency);
-        }
-        // The fee ceiling is enforced here *and* in the Factory, so a group can
-        // never charge more than the protocol maximum even if it were deployed
-        // by some other means.
-        if fee_bps == 0 || fee_bps > MAX_FEE_BPS {
-            soroban_sdk::panic_with_error!(&env, GroupError::InvalidFeeBps);
-        }
-
-        let config = GroupConfig {
-            factory,
-            creator,
-            token,
-            treasury,
-            contribution_amount,
-            member_capacity,
-            frequency_seconds,
-            fee_bps,
-        };
-
-        let storage = env.storage().instance();
-        storage.set(&DataKey::Config, &config);
-        storage.set(&DataKey::Status, &Status::Open);
-        storage.set(&DataKey::CurrentRound, &0u32);
-        storage.set(&DataKey::RoundPhase, &RoundPhase::WaitingForContributions);
-        storage.set(&DataKey::MemberCount, &0u32);
-        extend_instance_ttl(&env);
+    // === Events ===
+    /// Emitted when a group is created
+    struct GroupCreated has copy, drop {
+        group_id: address,
+        admin: address,
+        num_rounds: u64,
+        period_secs: u64,
+        contribution_amount: u64,
     }
 
-    /// Join the group, taking the next position in the payout order.
-    ///
-    /// The order in which members join is the payout order and is permanent: round
-    /// `n` pays the member at position `n`. Requires the joining member's own
-    /// authorization. Members may only join while the group is `Open`; once started,
-    /// membership is locked forever.
-    pub fn join(env: Env, member: Address) -> Result<u32, GroupError> {
-        member.require_auth();
-        extend_instance_ttl(&env);
-
-        let storage = env.storage().instance();
-        let status: Status = storage.get(&DataKey::Status).unwrap_or(Status::Draft);
-        if status != Status::Open {
-            return Err(GroupError::NotOpen);
-        }
-
-        let config: GroupConfig = storage.get(&DataKey::Config).unwrap();
-
-        let persistent = env.storage().persistent();
-        if persistent.has(&DataKey::Member(member.clone())) {
-            return Err(GroupError::AlreadyMember);
-        }
-
-        let count: u32 = storage.get(&DataKey::MemberCount).unwrap_or(0);
-        if count >= config.member_capacity {
-            return Err(GroupError::GroupFull);
-        }
-
-        let position = count + 1;
-        persistent.set(&DataKey::Member(member.clone()), &position);
-        persistent.set(&DataKey::MemberAt(position), &member);
-        storage.set(&DataKey::MemberCount, &position);
-        extend_persistent_ttl(&env, &DataKey::Member(member.clone()));
-        extend_persistent_ttl(&env, &DataKey::MemberAt(position));
-
-        MemberJoined { member, position }.publish(&env);
-        Ok(position)
+    /// Emitted when a member joins a group
+    struct MemberJoined has copy, drop {
+        group_id: address,
+        member: address,
+        position: u64,
     }
 
-    /// Start the group once membership has reached capacity.
-    ///
-    /// Permissionless by design: reaching capacity is exactly the state the group
-    /// agreed to start from, and starting locks configuration without moving any
-    /// funds, so there is nothing for a caller to gain or to grief. Requiring the
-    /// creator here would only let an absent creator stall a full group forever.
-    pub fn start(env: Env) -> Result<(), GroupError> {
-        extend_instance_ttl(&env);
-
-        let storage = env.storage().instance();
-        let status: Status = storage.get(&DataKey::Status).unwrap_or(Status::Draft);
-        if status != Status::Open {
-            return Err(GroupError::NotOpen);
-        }
-
-        let config: GroupConfig = storage.get(&DataKey::Config).unwrap();
-        let count: u32 = storage.get(&DataKey::MemberCount).unwrap_or(0);
-        if count != config.member_capacity {
-            return Err(GroupError::CapacityNotReached);
-        }
-
-        // Financial configuration and membership are now immutable for the life of
-        // the group. Nothing below can change them.
-        storage.set(&DataKey::Status, &Status::Active);
-        storage.set(&DataKey::CurrentRound, &1u32);
-        storage.set(&DataKey::RoundPhase, &RoundPhase::WaitingForContributions);
-
-        GroupStarted {
-            member_count: count,
-        }
-        .publish(&env);
-        Ok(())
+    /// Emitted when a member leaves a group
+    struct MemberLeft has copy, drop {
+        group_id: address,
+        member: address,
     }
 
-    /// Contribute the exact configured amount for a round.
-    ///
-    /// The caller must be the contributing member and must authorize this call.
-    /// A member can contribute at most once per round, and only while that round is
-    /// still collecting. Over- and under-payment are rejected rather than adjusted,
-    /// so the pool is always an exact multiple of the configured amount.
-    ///
-    /// State is written **before** the token transfer (checks-effects-interactions),
-    /// so a re-entrant token contract cannot contribute twice for the same member and
-    /// round.
-    pub fn contribute(
-        env: Env,
-        member: Address,
-        amount: i128,
-        round: u32,
-    ) -> Result<(), GroupError> {
-        member.require_auth();
-        extend_instance_ttl(&env);
+    /// Emitted when a payout is executed
+    struct PayoutExecuted has copy, drop {
+        group_id: address,
+        round: u64,
+        recipient: address,
+        amount: u64,
+    }
 
-        let storage = env.storage().instance();
-        let status: Status = storage.get(&DataKey::Status).unwrap_or(Status::Draft);
-        if status == Status::Completed {
-            return Err(GroupError::GroupCompleted);
-        }
-        if status != Status::Active {
-            return Err(GroupError::NotActive);
+    /// Emitted when a contribution is recorded
+    struct ContributionRecorded has copy, drop {
+        group_id: address,
+        member: address,
+        amount: u64,
+    }
+
+    // === Group Object ===
+    /// The main group object. Contains all group state.
+    struct Group has key {
+        id: uid,
+        /// The admin of the group
+        admin: address,
+        /// Whether the group is paused
+        paused: bool,
+        /// The members of the group, mapped by address -> position
+        members: table.Table<address, u64>,
+        /// The payout order, mapping round -> recipient address
+        payout_order: table.Table<u64, address>,
+        /// The current round
+        current_round: u64,
+        /// Total number of rounds
+        num_rounds: u64,
+        /// Period between rounds in seconds
+        period_secs: u64,
+        /// Contribution amount per member per round
+        contribution_amount: u64,
+        /// Total contributions collected this round
+        contributions_collected: balance::Balance<SUI>,
+    }
+
+    // === Admin Cap ===
+    /// Capability to administer the group
+    struct GroupCap has key, store {
+        id: uid,
+        group_id: address,
+    }
+
+    // === Constants ===
+    /// Minimum contribution amount
+    const MIN_CONTRIBUTION: u64 = 100000000; // 0.1 SUI
+
+    // === Public Functions ===
+
+    /// Creates a new group with the specified parameters.
+    /// Only the caller can be the initial admin.
+    public fun create_group(
+        num_rounds: u64,
+        period_secs: u64,
+        contribution_amount: u64,
+        payout_order: vector<vector<u8>>,
+        ctx: &mut TxContext
+    ): (object::Object<Group>, object::Object<GroupCap>) {
+        assert!(num_rounds > 0, error::permission_denied(EInvalidGroupState));
+        assert!(period_secs > 0, error::permission_denied(EInvalidGroupState));
+        assert!(contribution_amount >= MIN_CONTRIBUTION, error::permission_denied(EInvalidGroupState));
+        assert!(payout_order.len() == num_rounds as usize, error::permission_denied(EInvalidPayoutOrder));
+
+        let group = object::new(ctx);
+        let group_id = object::id(&group);
+
+        // Initialize tables
+        let members = table::new<address, u64>();
+        let payout_order_table = table::new<u64, address>();
+
+        // Populate payout order table
+        let i = 0;
+        while (i < payout_order.len()) {
+            let addr_bytes = payout_order[i];
+            assert!(!addr_bytes.is_empty(), error::permission_denied(EInvalidPayoutOrder));
+            let addr = @addr_bytes;
+            table::add(&mut payout_order_table, i as u64, addr);
+            i = i + 1;
         }
 
-        let config: GroupConfig = storage.get(&DataKey::Config).unwrap();
-        if amount != config.contribution_amount {
-            return Err(GroupError::WrongAmount);
-        }
+        // Transfer the group object to the sender's account
+        let sender = tx_context::sender(ctx);
+        object::transfer(group, sender);
 
-        let current_round: u32 = storage.get(&DataKey::CurrentRound).unwrap_or(0);
-        if round != current_round {
-            return Err(GroupError::WrongRound);
-        }
-
-        let phase: RoundPhase = storage.get(&DataKey::RoundPhase).unwrap();
-        if phase != RoundPhase::WaitingForContributions {
-            return Err(GroupError::WrongRoundPhase);
-        }
-
-        let persistent = env.storage().persistent();
-        if !persistent.has(&DataKey::Member(member.clone())) {
-            return Err(GroupError::NotAMember);
-        }
-
-        let contribution_key = DataKey::Contribution(RoundMember {
-            round,
-            member: member.clone(),
+        // Create and transfer the admin cap
+        let group_cap = object::new(ctx);
+        move_to(ctx, GroupCap {
+            id: object::uid_instantiate<&mut UID>(ctx),
+            group_id,
         });
-        // Presence of this entry is what makes a duplicate contribution impossible.
-        if persistent.has(&contribution_key) {
-            return Err(GroupError::AlreadyContributed);
-        }
+        object::transfer(group_cap, sender);
 
-        // Effects first: record the contribution and advance the round counters
-        // before any external call.
-        persistent.set(&contribution_key, &amount);
-        let pool: i128 = persistent.get(&DataKey::RoundPool(round)).unwrap_or(0i128);
-        let new_pool = match pool.checked_add(amount) {
-            Some(value) => value,
-            None => return Err(GroupError::ArithmeticOverflow),
-        };
-        let count_key = DataKey::RoundContributionCount(round);
-        let contribution_count: u32 = persistent.get(&count_key).unwrap_or(0);
-        let new_count = contribution_count + 1;
+        // Emit event
+        event::emit(GroupCreated {
+            group_id,
+            admin: sender,
+            num_rounds,
+            period_secs,
+            contribution_amount,
+        });
 
-        persistent.set(&DataKey::RoundPool(round), &new_pool);
-        persistent.set(&count_key, &new_count);
-        if new_count >= config.member_capacity {
-            storage.set(&DataKey::RoundPhase, &RoundPhase::ReadyForPayout);
-        }
+        (group, group_cap)
+    }
 
-        extend_persistent_ttl(&env, &contribution_key);
-        extend_persistent_ttl(&env, &DataKey::RoundPool(round));
-        extend_persistent_ttl(&env, &count_key);
+    /// Adds a member to the group at the specified position.
+    /// Only the admin can add members.
+    public fun add_member(
+        group_cap: &mut GroupCap,
+        member: address,
+        position: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(group_cap_admin_of(group_id(group_cap)) == tx_context::sender(ctx), error::permission_denied(EAdminOnly));
+        
+        let group = object::from<&mut object::Object<Group>>(group_id(group_cap));
+        assert!(!table::contains(&group.members, &member), error::already_exists(EAlreadyMember));
+        assert!(position < group.num_rounds, error::invalid_arguments(EInvalidRound));
 
-        // Interaction last.
-        token::Client::new(&env, &config.token).transfer(
-            &member,
-            env.current_contract_address(),
-            &amount,
-        );
+        table::add(&mut group.members, member, position);
 
-        ContributionReceived {
+        event::emit(MemberJoined {
+            group_id: group_id(group_cap),
             member,
-            round,
-            amount,
-        }
-        .publish(&env);
-        Ok(())
+            position,
+        });
     }
 
-    /// Pay out the current round to its scheduled recipient.
-    ///
-    /// Permissionless: once every member has contributed, the payout is the outcome
-    /// the group already agreed to, and the recipient and amounts are fixed by
-    /// configuration. The caller only supplies the trigger — they cannot influence
-    /// where funds go.
-    ///
-    /// Reverts with `ContributionsIncomplete` while any member is outstanding. This
-    /// is the WAIT behaviour: a round simply does not advance until it is fully
-    /// funded. There is no timeout, no skip, and no penalty.
-    pub fn execute_payout(env: Env) -> Result<(), GroupError> {
-        extend_instance_ttl(&env);
+    /// Removes a member from the group.
+    /// Only the admin can remove members.
+    public fun remove_member(
+        group_cap: &mut GroupCap,
+        member: address,
+        ctx: &mut TxContext
+    ) {
+        assert!(group_cap_admin_of(group_id(group_cap)) == tx_context::sender(ctx), error::permission_denied(EAdminOnly));
+        
+        let group = object::from<&mut object::Object<Group>>(group_id(group_cap));
+        assert!(table::contains(&group.members, &member), error::not_found(ENotMember));
 
-        let storage = env.storage().instance();
-        let status: Status = storage.get(&DataKey::Status).unwrap_or(Status::Draft);
-        if status == Status::Completed {
-            return Err(GroupError::GroupCompleted);
-        }
-        if status != Status::Active {
-            return Err(GroupError::NotActive);
-        }
+        table::remove(&mut group.members, &member);
 
-        let phase: RoundPhase = storage.get(&DataKey::RoundPhase).unwrap();
-        if phase == RoundPhase::PayoutExecuted {
-            return Err(GroupError::PayoutAlreadyExecuted);
-        }
-        if phase != RoundPhase::ReadyForPayout {
-            // Covers both "not everyone has contributed yet" and a malformed phase.
-            return Err(GroupError::ContributionsIncomplete);
-        }
+        event::emit(MemberLeft {
+            group_id: group_id(group_cap),
+            member,
+        });
+    }
 
-        let config: GroupConfig = storage.get(&DataKey::Config).unwrap();
-        let round: u32 = storage.get(&DataKey::CurrentRound).unwrap_or(0);
+    /// Pauses the group, preventing further contributions and payouts.
+    public fun pause_group(
+        group_cap: &mut GroupCap,
+        ctx: &mut TxContext
+    ) {
+        assert!(group_cap_admin_of(group_id(group_cap)) == tx_context::sender(ctx), error::permission_denied(EAdminOnly));
+        
+        let group = object::from<&mut object::Object<Group>>(group_id(group_cap));
+        group.paused = true;
+    }
 
-        let persistent = env.storage().persistent();
-        if persistent
-            .get(&DataKey::PayoutExecuted(round))
-            .unwrap_or(false)
-        {
-            return Err(GroupError::PayoutAlreadyExecuted);
-        }
+    /// Unpauses the group, allowing contributions and payouts again.
+    public fun unpause_group(
+        group_cap: &mut GroupCap,
+        ctx: &mut TxContext
+    ) {
+        assert!(group_cap_admin_of(group_id(group_cap)) == tx_context::sender(ctx), error::permission_denied(EAdminOnly));
+        
+        let group = object::from<&mut object::Object<Group>>(group_id(group_cap));
+        group.paused = false;
+    }
 
-        // The recipient is fixed by the join order; the caller has no say.
-        let recipient: Address = match persistent.get(&DataKey::MemberAt(round)) {
-            Some(address) => address,
-            None => return Err(GroupError::WrongRound),
-        };
+    /// Makes a contribution to the group.
+    public fun contribute(
+        group_cap: &mut GroupCap,
+        contribution: coin::Coin<SUI>,
+        ctx: &mut TxContext
+    ) {
+        let sender = tx_context::sender(ctx);
+        let group_id = group_id(group_cap);
+        let group = object::from<&mut object::Object<Group>>(group_id);
 
-        let pool: i128 = persistent.get(&DataKey::RoundPool(round)).unwrap_or(0i128);
+        // Check if group is paused
+        assert!(!group.paused, error::permission_denied(EGroupPaused));
 
-        let (fee, recipient_amount) = split_pool(pool, config.fee_bps)?;
+        // Check if sender is a member
+        assert!(table::contains(&group.members, &sender), error::not_found(ENotMember));
 
-        // Effects before interactions: mark the round paid and advance the round
-        // pointer so a re-entrant token cannot pay the same round twice.
-        persistent.set(&DataKey::PayoutExecuted(round), &true);
-        extend_persistent_ttl(&env, &DataKey::PayoutExecuted(round));
+        // Check contribution amount
+        assert!(coin::value(&contribution) == group.contribution_amount, error::invalid_arguments(EInsufficientContribution));
 
-        let is_final_round = round >= config.member_capacity;
-        if is_final_round {
-            storage.set(&DataKey::RoundPhase, &RoundPhase::PayoutExecuted);
-            storage.set(&DataKey::Status, &Status::Completed);
-        } else {
-            storage.set(&DataKey::CurrentRound, &(round + 1));
-            storage.set(&DataKey::RoundPhase, &RoundPhase::WaitingForContributions);
-        }
-
-        // Interactions last. The fee is protocol revenue; the remainder belongs to
-        // the scheduled recipient. Nothing is retained by this contract.
-        let token_client = token::Client::new(&env, &config.token);
-        if fee > 0 {
-            token_client.transfer(&env.current_contract_address(), &config.treasury, &fee);
-        }
-        token_client.transfer(
-            &env.current_contract_address(),
-            &recipient,
-            &recipient_amount,
+        // Record contribution
+        table::add(
+            &mut object::from<&mut object::Object<Group>>(group_id).contributions_collected,
+            coin::into_balance(contribution)
         );
 
-        PayoutExecuted {
+        event::emit(ContributionRecorded {
+            group_id,
+            member: sender,
+            amount: coin::value(&contribution),
+        });
+    }
+
+    /// Executes a payout to the current round's recipient.
+    public fun execute_payout(
+        group_cap: &mut GroupCap,
+        ctx: &mut TxContext
+    ): coin::Coin<SUI> {
+        let group_id = group_id(group_cap);
+        let group = object::from<&mut object::Object<Group>>(group_id);
+
+        // Check if group is paused
+        assert!(!group.paused, error::permission_denied(EGroupPaused));
+
+        // Get the current round's recipient
+        let current_round = group.current_round;
+        assert!(table::contains(&group.payout_order, &current_round), error::not_found(EInvalidRound));
+        
+        let recipient = table::borrow(&group.payout_order, &current_round);
+        
+        // Extend persistent storage for recipient to prevent archival
+        call_frame::persistent::extend(&recipient, 518_400);
+        
+        // Extend persistent storage for payout order entry
+        call_frame::persistent::extend(&current_round, 518_400);
+
+        // Transfer the accumulated contributions to the recipient
+        let balance = table::remove(
+            &mut object::from<&mut object::Object<Group>>(group_id).contributions_collected,
+        );
+        
+        let coins = coin::from_balance(balance);
+
+        // Advance to next round
+        group.current_round = current_round + 1;
+
+        event::emit(PayoutExecuted {
+            group_id,
+            round: current_round,
             recipient,
-            round,
-            recipient_amount,
-        }
-        .publish(&env);
-        FeePaid {
-            treasury: config.treasury,
-            round,
-            fee,
-        }
-        .publish(&env);
+            amount: coin::value(&coins),
+        });
 
-        if is_final_round {
-            GroupCompleted {
-                rounds: config.member_capacity,
-            }
-            .publish(&env);
-        }
-
-        Ok(())
+        coins
     }
 
-    // -----------------------------------------------------------------------
-    // Read-only views. None of these mutate state or move funds.
-    // -----------------------------------------------------------------------
+    // === View Functions ===
 
-    /// Full observable state of the group.
-    pub fn get_group(env: Env) -> GroupState {
-        let storage = env.storage().instance();
-        GroupState {
-            config: storage.get(&DataKey::Config).unwrap(),
-            status: storage.get(&DataKey::Status).unwrap_or(Status::Draft),
-            current_round: storage.get(&DataKey::CurrentRound).unwrap_or(0),
-            member_count: storage.get(&DataKey::MemberCount).unwrap_or(0),
-            round_phase: storage
-                .get(&DataKey::RoundPhase)
-                .unwrap_or(RoundPhase::WaitingForContributions),
-        }
+    /// Returns the admin address of the group
+    public fun group_admin(group_id: address): address {
+        let group = object::from<&object::Object<Group>>(group_id);
+        group.admin
     }
 
-    /// A member's 1-based position in the payout order, or `0` if not a member.
-    pub fn get_member(env: Env, address: Address) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Member(address))
-            .unwrap_or(0)
+    /// Returns whether the group is paused
+    public fun group_is_paused(group_id: address): bool {
+        let group = object::from<&object::Object<Group>>(group_id);
+        group.paused
     }
 
-    /// The number of members that have joined.
-    pub fn get_member_count(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::MemberCount)
-            .unwrap_or(0)
+    /// Returns whether an address is a member of the group
+    public fun is_member(group_id: address, member: address): bool {
+        let group = object::from<&object::Object<Group>>(group_id);
+        table::contains(&group.members, &member)
     }
 
-    /// The immutable payout order, in join order. Position `n` (1-based) is paid in
-    /// round `n`.
-    pub fn get_payout_order(env: Env) -> Vec<Address> {
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MemberCount)
-            .unwrap_or(0);
-        let persistent = env.storage().persistent();
-        let mut order = Vec::new(&env);
-        let mut position = 1u32;
-        while position <= count {
-            if let Some(address) = persistent.get(&DataKey::MemberAt(position)) {
-                order.push_back(address);
-            }
-            position += 1;
-        }
-        order
-    }
-
-    /// Observable state of a specific round.
-    pub fn get_round(env: Env, round: u32) -> RoundInfo {
-        let persistent = env.storage().persistent();
-        let payout_executed: bool = persistent
-            .get(&DataKey::PayoutExecuted(round))
-            .unwrap_or(false);
-        let recipient: Option<Address> = persistent.get(&DataKey::MemberAt(round));
-
-        // A round that has not started yet reports its phase as waiting.
-        let phase = if payout_executed {
-            RoundPhase::PayoutExecuted
+    /// Returns the position of a member in the payout order
+    public fun member_position(group_id: address, member: address): Option<u64> {
+        let group = object::from<&object::Object<Group>>(group_id);
+        if table::contains(&group.members, &member) {
+            option::some(table::borrow(&group.members, &member))
         } else {
-            let current_round: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::CurrentRound)
-                .unwrap_or(0);
-            if round == current_round {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::RoundPhase)
-                    .unwrap_or(RoundPhase::WaitingForContributions)
-            } else {
-                RoundPhase::WaitingForContributions
-            }
-        };
-
-        RoundInfo {
-            round,
-            pool: persistent.get(&DataKey::RoundPool(round)).unwrap_or(0i128),
-            contribution_count: persistent
-                .get(&DataKey::RoundContributionCount(round))
-                .unwrap_or(0),
-            phase,
-            payout_executed,
-            recipient,
+            option::none()
         }
     }
 
-    /// The member scheduled to receive the current round's payout.
-    pub fn get_current_recipient(env: Env) -> Result<Address, GroupError> {
-        let round: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CurrentRound)
-            .unwrap_or(0);
-        if round == 0 {
-            return Err(GroupError::NotActive);
+    /// Returns the total number of members
+    public fun member_count(group_id: address): u64 {
+        let group = object::from<&object::Object<Group>>(group_id);
+        table::length(&group.members)
+    }
+
+    /// Returns the current round
+    public fun current_round(group_id: address): u64 {
+        let group = object::from<&object::Object<Group>>(group_id);
+        group.current_round
+    }
+
+    /// Returns the total number of rounds
+    public fun num_rounds(group_id: address): u64 {
+        let group = object::from<&object::Object<Group>>(group_id);
+        group.num_rounds
+    }
+
+    /// Returns the period in seconds
+    public fun period_secs(group_id: address): u64 {
+        let group = object::from<&object::Object<Group>>(group_id);
+        group.period_secs
+    }
+
+    /// Returns the contribution amount
+    public fun contribution_amount(group_id: address): u64 {
+        let group = object::from<&object::Object<Group>>(group_id);
+        group.contribution_amount
+    }
+
+    // === Internal Functions ===
+
+    fun group_id(group_cap: &GroupCap): address {
+        group_cap.group_id
+    }
+
+    fun group_cap_admin_of(group_id: address): address {
+        let group = object::from<&object::Object<Group>>(group_id);
+        group.admin
+    }
+
+    // === Tests ===
+    #[test_only]
+    module group_tests {
+        use super::*;
+        use sui::test_utils;
+        use sui::tx_context::{Self, TxContext};
+
+        fun test_create_group(ctx: &mut TxContext) {
+            let (group, group_cap) = create_group(
+                12,
+                604800, // 1 week
+                100000000, // 0.1 SUI
+                vector![vector![1], vector![2], vector![3]],
+                ctx
+            );
+
+            assert!(current_round(object::id(&group)) == 0, 0);
+            assert!(num_rounds(object::id(&group)) == 12, 0);
+            assert!(period_secs(object::id(&group)) == 604800, 0);
+            assert!(contribution_amount(object::id(&group)) == 100000000, 0);
         }
-        match env.storage().persistent().get(&DataKey::MemberAt(round)) {
-            Some(address) => Ok(address),
-            None => Err(GroupError::WrongRound),
+
+        fun test_add_member(ctx: &mut TxContext) {
+            let (group, mut group_cap) = create_group(
+                3,
+                604800,
+                100000000,
+                vector![vector![1], vector![2], vector![3]],
+                ctx
+            );
+
+            let member = @1;
+            add_member(&mut group_cap, member, 0, ctx);
+            
+            assert!(is_member(object::id(&group), member), 0);
+            assert!(member_position(object::id(&group), member) == option::some(0), 0);
         }
-    }
 
-    /// The current round number, or `0` before the group starts.
-    pub fn get_current_round(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::CurrentRound)
-            .unwrap_or(0)
-    }
+        fun test_cannot_add_duplicate_member(ctx: &mut TxContext) {
+            let (group, mut group_cap) = create_group(
+                3,
+                604800,
+                100000000,
+                vector![vector![1], vector![2], vector![3]],
+                ctx
+            );
 
-    /// Contributions validated for the current round.
-    ///
-    /// This is derived from validated contributions, not from the contract's raw
-    /// token balance, so a stray transfer into the contract cannot inflate a
-    /// payout. In normal operation the two are equal, because every round pays out
-    /// in full.
-    pub fn get_pool_balance(env: Env) -> i128 {
-        let round: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CurrentRound)
-            .unwrap_or(0);
-        if round == 0 {
-            return 0;
+            let member = @1;
+            add_member(&mut group_cap, member, 0, ctx);
+            
+            // Should fail - already a member
+            test_utils::assert_aborted_with(
+                &extract(group),
+                &mut group_cap,
+                EAlreadyMember,
+                |g, cap| add_member(cap, member, 0, ctx)
+            );
         }
-        env.storage()
-            .persistent()
-            .get(&DataKey::RoundPool(round))
-            .unwrap_or(0i128)
-    }
-
-    /// Whether every member has contributed to the current round.
-    pub fn is_contribution_complete(env: Env) -> bool {
-        let storage = env.storage().instance();
-        let config: GroupConfig = match storage.get(&DataKey::Config) {
-            Some(config) => config,
-            None => return false,
-        };
-        let round: u32 = storage.get(&DataKey::CurrentRound).unwrap_or(0);
-        if round == 0 {
-            return false;
-        }
-        let count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RoundContributionCount(round))
-            .unwrap_or(0);
-        count >= config.member_capacity
-    }
-
-    /// The group's lifecycle status.
-    pub fn get_status(env: Env) -> Status {
-        env.storage()
-            .instance()
-            .get(&DataKey::Status)
-            .unwrap_or(Status::Draft)
-    }
-
-    /// The single token this group accepts.
-    pub fn get_token(env: Env) -> Address {
-        let config: GroupConfig = env.storage().instance().get(&DataKey::Config).unwrap();
-        config.token
-    }
-
-    /// Returns the ABI/interface version of this contract.
-    ///
-    /// Metadata only — carries no financial meaning.
-    pub fn version(_env: Env) -> u32 {
-        CONTRACT_VERSION
     }
 }
-
-/// Splits a pool into the protocol fee and the recipient's amount.
-///
-/// Integer arithmetic only, with a defensive check on the invariant
-/// `fee + recipient_amount == pool`. If that ever fails, the payout reverts rather
-/// than paying an incorrect split.
-fn split_pool(pool: i128, fee_bps: u32) -> Result<(i128, i128), GroupError> {
-    let numerator = match pool.checked_mul(fee_bps as i128) {
-        Some(value) => value,
-        None => return Err(GroupError::ArithmeticOverflow),
-    };
-    let fee = numerator / BPS_DENOMINATOR;
-    let recipient_amount = pool - fee;
-
-    if fee + recipient_amount != pool {
-        return Err(GroupError::SplitInvariantViolated);
-    }
-    Ok((fee, recipient_amount))
-}
-
-/// Extends the instance entry's TTL so an active group never archives.
-fn extend_instance_ttl(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
-}
-
-/// Extends a persistent entry's TTL so membership and contribution history stay
-/// readable for the life of a group, which can span many months.
-fn extend_persistent_ttl(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
-}
-
-mod test;

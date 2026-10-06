@@ -1,0 +1,10 @@
+[package]
+name = "group"
+edition = "2024.beta" # edition = "legacy" to build with Move 1.0
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLab/sui.git", subdir = "crates/sui-framework", rev = "framework/mainnet" }
+
+[addresses]
+group = "0x0"
+sui = "0x0000000000000000000000000000000000000002"
