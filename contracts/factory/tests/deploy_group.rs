@@ -15,7 +15,9 @@
 
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
-    token, Address, Bytes, Env, Event as _,
+    token,
+    xdr::{ContractEventBody, ScVal},
+    Address, Bytes, Env, Event as _, FromVal, IntoVal, Symbol, Val,
 };
 use susu_factory::{FactoryContract, FactoryContractClient};
 use susu_group::{GroupContractClient, Status};
@@ -123,6 +125,98 @@ fn create_group_assigns_distinct_addresses_and_monotonic_ids() {
     assert_eq!(second_state.config.member_capacity, 2);
 }
 
+// Inspect the emitted XDR independently of GroupCreated's derived serialization,
+// so adding a topic or omitting a data field cannot be hidden by the expected type.
+fn assert_creation_event_terms(
+    harness: &Harness,
+    creator: &Address,
+    group: &Address,
+    treasury: &Address,
+    fee_bps: u32,
+    frequency_seconds: u64,
+) {
+    let events = harness
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&harness.factory_id);
+    assert_eq!(events.events().len(), 1);
+    let ContractEventBody::V0(body) = &events.events()[0].body;
+    let expected_topics: soroban_sdk::Vec<Val> = (
+        Symbol::new(&harness.env, "susu"),
+        Symbol::new(&harness.env, "group_created"),
+        creator.clone(),
+        group.clone(),
+    )
+        .into_val(&harness.env);
+    assert_eq!(body.topics, expected_topics.into());
+
+    let ScVal::Map(Some(data)) = &body.data else {
+        panic!("GroupCreated must contain a data map");
+    };
+    let field = |name: &str| {
+        let key = ScVal::Symbol(name.try_into().unwrap());
+        data.iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| &entry.val)
+    };
+    assert_eq!(field("fee_bps"), Some(&ScVal::U32(fee_bps)));
+    assert_eq!(
+        field("treasury"),
+        Some(&ScVal::from_val(&harness.env, &treasury.to_val()))
+    );
+    assert_eq!(
+        field("frequency_seconds"),
+        Some(&ScVal::U64(frequency_seconds))
+    );
+}
+
+#[test]
+fn create_group_event_records_frozen_terms_across_factory_updates() {
+    let harness = Harness::new();
+    let creator = Address::generate(&harness.env);
+    let first =
+        harness
+            .client
+            .create_group(&creator, &harness.token, &(10 * ONE_USDC), &3u32, &ONE_WEEK);
+    assert_creation_event_terms(&harness, &creator, &first, &harness.treasury, 50, ONE_WEEK);
+
+    let next_treasury = Address::generate(&harness.env);
+    harness.client.set_fee(&25);
+    harness.client.set_treasury(&next_treasury);
+    let next_frequency = 2 * ONE_WEEK;
+    let second = harness.client.create_group(
+        &creator,
+        &harness.token,
+        &(20 * ONE_USDC),
+        &2u32,
+        &next_frequency,
+    );
+    assert_creation_event_terms(
+        &harness,
+        &creator,
+        &second,
+        &next_treasury,
+        25,
+        next_frequency,
+    );
+
+    // Updating the Factory changes the next creation event and Group together,
+    // while the first Group retains the terms represented by its own event.
+    let first_config = GroupContractClient::new(&harness.env, &first)
+        .get_group()
+        .config;
+    assert_eq!(first_config.fee_bps, 50);
+    assert_eq!(first_config.treasury, harness.treasury);
+    assert_eq!(first_config.frequency_seconds, ONE_WEEK);
+    let second_config = GroupContractClient::new(&harness.env, &second)
+        .get_group()
+        .config;
+    assert_eq!(second_config.fee_bps, 25);
+    assert_eq!(second_config.treasury, next_treasury);
+    assert_eq!(second_config.frequency_seconds, next_frequency);
+}
+
 #[test]
 fn a_deployed_group_runs_a_full_cycle() {
     // The Factory's job is to produce a group that is correct; verify one end to end.
@@ -180,6 +274,9 @@ fn a_deployed_group_runs_a_full_cycle() {
         token: harness.token.clone(),
         contribution_amount: 10 * ONE_USDC,
         member_capacity: 3,
+        fee_bps: 50,
+        treasury: harness.treasury.clone(),
+        frequency_seconds: ONE_WEEK,
     }
     .to_xdr(&harness.env, &harness.factory_id);
     assert!(created_events.events().contains(&expected));
