@@ -60,6 +60,36 @@ fn constructor_rejects_zero_fee() {
     setup(0);
 }
 
+#[test]
+#[should_panic]
+fn constructor_rejects_treasury_equal_to_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    env.register(
+        FactoryContract,
+        (admin.clone(), wasm_hash, admin, MAX_FEE_BPS),
+    );
+}
+
+#[test]
+#[should_panic]
+fn constructor_rejects_treasury_equal_to_the_factory_itself() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    // Register at a predetermined address so the treasury argument can be the
+    // factory itself.
+    let factory_id = Address::generate(&env);
+    env.register_at(
+        &factory_id,
+        FactoryContract,
+        (admin, wasm_hash, factory_id.clone(), MAX_FEE_BPS),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fee configuration
 // ---------------------------------------------------------------------------
@@ -141,6 +171,27 @@ fn set_treasury_requires_admin_authorization() {
     let new_treasury = Address::generate(&env);
 
     assert!(client.try_set_treasury(&new_treasury).is_err());
+}
+
+#[test]
+fn set_treasury_rejects_the_admin_address() {
+    let (_, admin, _, client) = setup(MAX_FEE_BPS);
+
+    assert_eq!(
+        client.try_set_treasury(&admin),
+        Err(Ok(FactoryError::TreasuryEqualsAdmin))
+    );
+}
+
+#[test]
+fn set_treasury_rejects_the_factory_address() {
+    let (_, _, _, client) = setup(MAX_FEE_BPS);
+    let factory_id = client.address.clone();
+
+    assert_eq!(
+        client.try_set_treasury(&factory_id),
+        Err(Ok(FactoryError::TreasuryEqualsFactory))
+    );
 }
 
 // ---------------------------------------------------------------------------
