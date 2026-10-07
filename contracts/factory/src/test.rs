@@ -9,7 +9,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Event,
 };
 
@@ -297,4 +297,46 @@ fn set_treasury_rejects_admin_or_factory_address() {
 
     let res_factory = client.try_set_treasury(&factory_addr);
     assert_eq!(res_factory, Err(Ok(FactoryError::InvalidTreasury)));
+}
+
+// ---------------------------------------------------------------------------
+// Instance TTL on read paths (issue #19)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_config_still_returns_configuration_past_ttl_threshold() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+
+    // Advance the ledger past the TTL threshold. The read path extends the
+    // instance TTL as part of the call, so the configuration is still
+    // returned instead of the entry being unrecoverable.
+    env.ledger().set_sequence_number(INSTANCE_TTL_THRESHOLD + 1);
+
+    let config = client.get_config();
+    assert_eq!(config.fee_bps, MAX_FEE_BPS);
+}
+
+#[test]
+fn get_group_count_still_works_past_ttl_threshold() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+
+    env.ledger().set_sequence_number(INSTANCE_TTL_THRESHOLD + 1);
+
+    assert_eq!(client.get_group_count(), 0);
+}
+
+#[test]
+fn get_config_returns_not_initialized_instead_of_panicking() {
+    // Simulate the configuration entry being absent (never initialized, or
+    // archived): the read must return the typed error, not panic on an unwrap.
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let factory_id = client.address.clone();
+    env.as_contract(&factory_id, || {
+        env.storage().instance().remove(&DataKey::Config);
+    });
+
+    assert_eq!(
+        client.try_get_config(),
+        Err(Ok(FactoryError::NotInitialized))
+    );
 }
