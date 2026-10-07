@@ -96,6 +96,9 @@ pub enum FactoryError {
     ArithmeticOverflow = 7,
     /// Treasury address cannot be the admin or the factory itself.
     InvalidTreasury = 8,
+    /// The Factory configuration is absent: the contract was never initialized
+    /// (or its instance entry archived).
+    NotInitialized = 9,
 }
 
 /// A new group contract was deployed and registered.
@@ -196,7 +199,7 @@ impl FactoryContract {
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let config: FactoryConfig = read_config(&env)?;
 
         if config.paused {
             return Err(FactoryError::Paused);
@@ -274,7 +277,7 @@ impl FactoryContract {
     /// Capped at `MAX_FEE_BPS`, so the protocol can never charge more than 0.50%.
     /// Existing groups are unaffected: they froze their fee at construction.
     pub fn set_fee(env: Env, fee_bps: u32) -> Result<(), FactoryError> {
-        require_admin(&env);
+        require_admin(&env)?;
         extend_instance_ttl(&env);
 
         if fee_bps == 0 || fee_bps > MAX_FEE_BPS {
@@ -282,7 +285,7 @@ impl FactoryContract {
         }
 
         let storage = env.storage().instance();
-        let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let mut config: FactoryConfig = read_config(&env)?;
         config.fee_bps = fee_bps;
         storage.set(&DataKey::Config, &config);
 
@@ -295,11 +298,11 @@ impl FactoryContract {
     /// Existing groups are unaffected: they froze their treasury at construction, so
     /// a treasury change can never redirect fees already owed to a group.
     pub fn set_treasury(env: Env, treasury: Address) -> Result<(), FactoryError> {
-        require_admin(&env);
+        require_admin(&env)?;
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let mut config: FactoryConfig = read_config(&env)?;
         if treasury == config.admin || treasury == env.current_contract_address() {
             return Err(FactoryError::InvalidTreasury);
         }
@@ -316,11 +319,11 @@ impl FactoryContract {
     /// rounds, payouts and funds are entirely outside the Factory's reach. It cannot
     /// block a contribution or a payout either.
     pub fn pause(env: Env) -> Result<(), FactoryError> {
-        require_admin(&env);
+        require_admin(&env)?;
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let mut config: FactoryConfig = read_config(&env)?;
         config.paused = true;
         storage.set(&DataKey::Config, &config);
 
@@ -330,11 +333,11 @@ impl FactoryContract {
 
     /// Re-enable creation of new groups.
     pub fn unpause(env: Env) -> Result<(), FactoryError> {
-        require_admin(&env);
+        require_admin(&env)?;
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let mut config: FactoryConfig = read_config(&env)?;
         config.paused = false;
         storage.set(&DataKey::Config, &config);
 
@@ -347,8 +350,13 @@ impl FactoryContract {
     // -----------------------------------------------------------------------
 
     /// The Factory's current configuration.
-    pub fn get_config(env: Env) -> FactoryConfig {
-        env.storage().instance().get(&DataKey::Config).unwrap()
+    ///
+    /// Extends the instance TTL as part of the read so the entry cannot
+    /// archive under a read-only workload. Returns a typed error instead of
+    /// panicking when the contract was never initialized.
+    pub fn get_config(env: Env) -> Result<FactoryConfig, FactoryError> {
+        extend_instance_ttl(&env);
+        read_config(&env)
     }
 
     /// The address of a group by id.
@@ -360,7 +368,11 @@ impl FactoryContract {
     }
 
     /// The number of groups created so far.
+    ///
+    /// Extends the instance TTL as part of the read so the entry cannot
+    /// archive under a read-only workload.
     pub fn get_group_count(env: Env) -> u32 {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::GroupCount)
@@ -386,10 +398,21 @@ pub fn group_salt(env: &Env, group_id: u32) -> BytesN<32> {
     BytesN::from_array(env, &salt)
 }
 
+/// Reads the factory configuration, returning a typed error instead of
+/// panicking when the contract was never initialized (or its instance entry
+/// archived).
+fn read_config(env: &Env) -> Result<FactoryConfig, FactoryError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Config)
+        .ok_or(FactoryError::NotInitialized)
+}
+
 /// Requires the protocol admin's authorization.
-fn require_admin(env: &Env) {
-    let config: FactoryConfig = env.storage().instance().get(&DataKey::Config).unwrap();
+fn require_admin(env: &Env) -> Result<(), FactoryError> {
+    let config = read_config(env)?;
     config.admin.require_auth();
+    Ok(())
 }
 
 /// Extends the instance entry's TTL so the Factory never archives.
