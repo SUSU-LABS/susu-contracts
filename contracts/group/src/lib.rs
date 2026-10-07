@@ -252,6 +252,9 @@ pub enum GroupError {
     /// Defensive: unreachable by construction, asserted so any future change to
     /// the money math fails loudly instead of silently mis-splitting funds.
     SplitInvariantViolated = 19,
+    /// The treasury is the group's own address. Fees paid to it would land back
+    /// in the pool as stray funds ignored by `get_pool_balance`.
+    TreasuryEqualsGroup = 20,
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +364,12 @@ impl GroupContract {
         // by some other means.
         if fee_bps == 0 || fee_bps > MAX_FEE_BPS {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidFeeBps);
+        }
+        // A treasury that is the group itself would make execute_payout send
+        // the fee back into the pool, where it becomes stray funds ignored by
+        // get_pool_balance. Reject it at construction.
+        if treasury == env.current_contract_address() {
+            soroban_sdk::panic_with_error!(&env, GroupError::TreasuryEqualsGroup);
         }
 
         let config = GroupConfig {
