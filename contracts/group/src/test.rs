@@ -384,6 +384,33 @@ fn constructor_rejects_zero_fee() {
 
 #[test]
 #[should_panic]
+fn constructor_rejects_treasury_equal_to_the_group_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    // Register at a predetermined address so the treasury argument can be the
+    // group itself.
+    let group_id = Address::generate(&env);
+    env.register_at(
+        &group_id,
+        GroupContract,
+        (
+            Address::generate(&env), // factory (informational)
+            Address::generate(&env), // creator (informational, no authority)
+            token,
+            group_id.clone(), // treasury == the group itself
+            ONE_USDC,
+            3u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
 fn constructor_rejects_zero_frequency() {
     let env = Env::default();
     env.mock_all_auths();
