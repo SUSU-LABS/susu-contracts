@@ -611,6 +611,29 @@ fn contribute_rejects_a_duplicate_contribution_in_the_same_round() {
 }
 
 #[test]
+fn contribute_rejects_an_overflowing_round_contribution_count() {
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    // Force the round contribution counter to u32::MAX so the next increment
+    // would overflow. In practice member_capacity (<= 100) bounds this, but
+    // the count must not rely on that non-local invariant.
+    setup.env.as_contract(&setup.group_id, || {
+        setup
+            .env
+            .storage()
+            .persistent()
+            .set(&DataKey::RoundContributionCount(1), &u32::MAX);
+    });
+
+    assert_eq!(
+        setup
+            .client()
+            .try_contribute(&setup.member(0), &setup.amount, &1u32),
+        Err(Ok(GroupError::ArithmeticOverflow)),
+        "a saturated counter must surface ArithmeticOverflow, not wrap or abort"
+    );
+}
+
+#[test]
 fn contribute_requires_the_members_own_authorization() {
     let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
     let client = setup.client();
