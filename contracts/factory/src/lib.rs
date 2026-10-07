@@ -94,6 +94,10 @@ pub enum FactoryError {
     GroupNotFound = 6,
     /// Integer arithmetic overflowed. Never expected for valid inputs.
     ArithmeticOverflow = 7,
+    /// The treasury equals the admin address.
+    TreasuryEqualsAdmin = 8,
+    /// The treasury equals the Factory's own address.
+    TreasuryEqualsFactory = 9,
 }
 
 /// A new group contract was deployed and registered.
@@ -157,6 +161,15 @@ impl FactoryContract {
     ) {
         if fee_bps == 0 || fee_bps > MAX_FEE_BPS {
             soroban_sdk::panic_with_error!(&env, FactoryError::InvalidFeeBps);
+        }
+        // A treasury that is the admin or the Factory itself would trap fees
+        // where they cannot be recovered as a dedicated treasury. Reject both
+        // at construction.
+        if treasury == admin {
+            soroban_sdk::panic_with_error!(&env, FactoryError::TreasuryEqualsAdmin);
+        }
+        if treasury == env.current_contract_address() {
+            soroban_sdk::panic_with_error!(&env, FactoryError::TreasuryEqualsFactory);
         }
         let config = FactoryConfig {
             admin,
@@ -295,6 +308,14 @@ impl FactoryContract {
 
         let storage = env.storage().instance();
         let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        // A treasury that is the admin or the Factory itself would trap fees
+        // where they cannot be recovered as a dedicated treasury. Reject both.
+        if treasury == config.admin {
+            return Err(FactoryError::TreasuryEqualsAdmin);
+        }
+        if treasury == env.current_contract_address() {
+            return Err(FactoryError::TreasuryEqualsFactory);
+        }
         config.treasury = treasury.clone();
         storage.set(&DataKey::Config, &config);
 
