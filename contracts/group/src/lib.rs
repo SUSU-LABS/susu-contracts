@@ -523,7 +523,12 @@ impl GroupContract {
         };
         let count_key = DataKey::RoundContributionCount(round);
         let contribution_count: u32 = persistent.get(&count_key).unwrap_or(0);
-        let new_count = contribution_count + 1;
+        // Same checked pattern as the pool update above: an overflow must
+        // surface as ArithmeticOverflow rather than aborting the host.
+        let new_count = match contribution_count.checked_add(1) {
+            Some(value) => value,
+            None => return Err(GroupError::ArithmeticOverflow),
+        };
 
         persistent.set(&DataKey::RoundPool(round), &new_pool);
         persistent.set(&count_key, &new_count);
