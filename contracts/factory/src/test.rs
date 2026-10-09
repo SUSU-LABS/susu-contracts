@@ -37,15 +37,37 @@ fn setup(fee_bps: u32) -> (Env, Address, Address, FactoryContractClient<'static>
 
 #[test]
 fn constructor_stores_configuration() {
-    let (_, admin, treasury, client) = setup(MAX_FEE_BPS);
+    let (env, admin, treasury, client) = setup(MAX_FEE_BPS);
 
     let config = client.get_config();
-    assert_eq!(config.admin, admin);
-    assert_eq!(config.treasury, treasury);
+    assert_eq!(config.admin, admin.clone());
+    assert_eq!(config.treasury, treasury.clone());
     assert_eq!(config.fee_bps, MAX_FEE_BPS);
     assert!(!config.paused, "a new Factory is not paused");
     assert_eq!(client.get_group_count(), 0);
     assert_eq!(client.version(), 3);
+
+    let emitted = env.events().all().filter_by_contract(&client.address);
+    let expected = FactoryInitialized {
+        admin,
+        treasury,
+        fee_bps: MAX_FEE_BPS,
+        group_wasm_hash: config.group_wasm_hash,
+    }
+    .to_xdr(&env, &client.address);
+
+    assert!(
+        emitted.events().contains(&expected),
+        "constructor must emit FactoryInitialized event"
+    );
+
+    let mut count = 0;
+    for e in emitted.events().into_iter() {
+        if e == expected {
+            count += 1;
+        }
+    }
+    assert_eq!(count, 1, "event must be emitted exactly once");
 }
 
 #[test]
