@@ -384,3 +384,20 @@ fn factory_pause_does_not_affect_existing_groups() {
 
     assert_eq!(group.get_status(), Status::Completed);
 }
+
+#[test]
+fn create_group_rejects_token_equal_to_factory() {
+    let harness = Harness::new();
+    let creator = Address::generate(&harness.env);
+
+    assert_eq!(
+        harness.client.try_create_group(
+            &creator,
+            &harness.factory_id,
+            &(10 * ONE_USDC),
+            &3u32,
+            &ONE_WEEK,
+        ),
+        Err(Ok(FactoryError::InvalidToken))
+    );
+}

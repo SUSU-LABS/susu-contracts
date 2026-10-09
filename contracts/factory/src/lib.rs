@@ -100,6 +100,8 @@ pub enum FactoryError {
     /// the admin can still reach `pause` and recover a contract whose instance
     /// entry has archived.
     NotInitialized = 9,
+    /// Token address cannot be the factory itself.
+    InvalidToken = 10,
 }
 
 /// A new group contract was deployed and registered.
@@ -204,6 +206,9 @@ impl FactoryContract {
 
         if config.paused {
             return Err(FactoryError::Paused);
+        }
+        if token == env.current_contract_address() {
+            return Err(FactoryError::InvalidToken);
         }
         if contribution_amount <= 0
             || contribution_amount

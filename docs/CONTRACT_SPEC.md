@@ -135,7 +135,7 @@ Returns `CONTRACT_VERSION`.
 
 `InvalidFeeBps = 1`, `InvalidContributionAmount = 2`, `InvalidMemberCapacity = 3`,
 `InvalidFrequency = 4`, `Paused = 5`, `GroupNotFound = 6`, `ArithmeticOverflow = 7`,
-`InvalidTreasury = 8`, `NotInitialized = 9`.
+`InvalidTreasury = 8`, `NotInitialized = 9`, `InvalidToken = 10`.
 
 ---
 
@@ -209,7 +209,8 @@ emitting `PayoutExecuted` and `FeePaid`.
 `CapacityNotReached = 8`, `NotActive = 9`, `NotAMember = 10`, `WrongRound = 11`,
 `WrongAmount = 12`, `AlreadyContributed = 13`, `ContributionsIncomplete = 14`,
 `PayoutAlreadyExecuted = 15`, `WrongRoundPhase = 16`, `GroupCompleted = 17`,
-`ArithmeticOverflow = 18`, `SplitInvariantViolated = 19`.
+`ArithmeticOverflow = 18`, `SplitInvariantViolated = 19`, `InvalidTreasury = 20`,
+`InvalidToken = 21`.
 
 ---
 
