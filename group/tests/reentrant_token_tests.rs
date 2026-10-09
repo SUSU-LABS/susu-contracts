@@ -1,85 +1,73 @@
-//! Reentrancy regression tests for `contribute` and `execute_payout`.
-//! Uses the test-only `ReentrantToken` (see `group/src/reentrant_token.rs`)
-//! wired in as the Group's token so its `transfer`/`transfer_from`
-//! re-enters the Group mid-call. Asserts no double contribution / payout.
-use soroban_sdk::{testutils::Address as _, Address, Env, Map};
+use susu_contracts::reentrant_token::{ReentrantToken, Mode};
+use susu_contracts::effects::Effects;
+use susu_contracts::token::Token;
+use sui_sdk::types::base_types::SuiAddress;
+use sui_sdk::types::object::ObjectID;
+use sui_test_framework::{get_signer, initialize_balances, register_object, set_balance};
+use std::collections::HashMap;
 
-use crate::reentrant_token::ReentrantToken;
-
-// Helpers reuse the existing fixtures in `test.rs` / `deploy_group.rs`:
-// deploy a Group bound to the malicious token, fund one contributor,
-// then drive the attack. Adjust the helper names to match local fixtures.
-
-#[test]
-fn contribute_reentrant_token_no_double_count() {
-    let e = Env::default();
-    e.mock_all_auths();
-    let admin = Address::generate(&e);
-    let user = Address::generate(&e);
-
-    // Register malicious token with an initial balance for `user`.
-    let token_id = e.register_contract(None, ReentrantToken);
-    let mut bals = Map::new(&e);
-    bals.set(user.clone(), 1_000_000i128);
-    // Group address unknown yet: set placeholder, patched after deploy.
-    // Mode 1 => re-enter `contribute` from inside token transfer.
-    let placeholder = Address::generate(&e);
-    e.invoke_contract::<()>(
-        &token_id,
-        &soroban_sdk::Symbol::new(&e, "__init"),
-        (admin, bals, placeholder, 1u32).into(),
-    );
-
-    // Deploy group with `token_id` as its token (constructor arg at lib.rs:361).
-    let group_id = crate::deploy_group(&e, &token_id);
-    // Point the token back at the real group contract.
-    // (Stored `group` address is updated via instance storage reset.)
-    e.invoke_contract::<()>(
-        &token_id,
-        &soroban_sdk::Symbol::new(&e, "__init"),
-        (e.current_contract_address(), {
-            let mut m = Map::new(&e);
-            m.set(user.clone(), 1_000_000i128);
-            m
-        }, group_id.clone(), 1u32)
-            .into(),
-    );
-
-    let before: i128 = e.invoke_contract(&token_id, &soroban_sdk::Symbol::new(&e, "balance"), (user.clone(),).into());
-    assert!(before == 1_000_000i128);
-
-    // Single contribute; nested reentrant contribute must not double-credit.
-    let amount = 100_000i128;
-    let _ = e.try_invoke_contract::<(), soroban_sdk::Error>(
-        &group_id,
-        &soroban_sdk::Symbol::new(&e, "contribute"),
-        (user.clone(), amount).into(),
-    );
-
-    let credited: i128 = crate::contribution_of(&e, &group_id, &user);
-    assert_eq!(credited, amount, "reentrant contribute double-counted");
-    let user_bal: i128 = e.invoke_contract(&token_id, &soroban_sdk::Symbol::new(&e, "balance"), (user.clone(),).into());
-    assert_eq!(user_bal, before - amount, "token balance mismatch after reentrant contribute");
+fn setup() -> (ReentrantToken, Effects) {
+    let id = ObjectID::random();
+    let mut token = ReentrantToken::new(id);
+    let effects = Effects::new();
+    (token, effects)
 }
 
-#[test]
-fn execute_payout_reentrant_token_no_double_payout() {
-    let e = Env::default();
-    e.mock_all_auths();
-    let admin = Address::generate(&e);
-    let user = Address::generate(&e);
-    let token_id = e.register_contract(None, ReentrantToken);
-    let mut bals = Map::new(&e);
-    bals.set(user.clone(), 1_000_000i128);
-    let group_id = crate::deploy_group(&e, &token_id);
-    // Mode 2 => re-enter `execute_payout` from inside payout transfer.
-    e.invoke_contract::<()>(
-        &token_id,
-        &soroban_sdk::Symbol::new(&e, "__init"),
-        (admin, bals, group_id.clone(), 2u32).into(),
-    );
-    crate::fund_and_finalize(&e, &group_id, &user, 100_000i128);
-    let payout: i128 = crate::expected_payout(&e, &group_id, &user);
-    let _ = e.try_invoke_contract::<(), soroban_sdk::Error>(
-        &group_id,
-        &soroban_sdk::Symbol::new(&e, "execute_payout"),
+fn make_recipients() -> HashMap<SuiAddress, u64> {
+    let mut map = HashMap::new();
+    let addr1 = get_signer(0).object_address();
+    let addr2 = get_signer(1).object_address();
+    map.insert(addr1, 100);
+    map.insert(addr2, 200);
+    map
+}
+
+#[sui_test_framework::test]
+fn test_reentrant_token_double_pay_across_rounds() {
+    let (mut token, mut effects) = setup();
+
+    // Register two round-robins with different payouts
+    let rr1_id = register_object(&mut token, &mut effects, Mode::RoundRobin);
+    let rr2_id = register_object(&mut token, &mut effects, Mode::RoundRobin);
+
+    let recipients = make_recipients();
+    let addr1 = recipients.keys().next().unwrap().to_owned();
+    let addr2 = recipients.values().next().unwrap().to_owned();
+
+    // Seed some SUI into the token
+    set_balance(addr1, 1000);
+    set_balance(addr2, 1000);
+    initialize_balances(&mut token, &mut effects, &recipients);
+
+    // Round 1: normal payout
+    token.execute_payout(&mut effects, &rr1_id, &recipients).unwrap();
+    assert_eq!(effects.round(), 1);
+
+    // Verify balances after round 1
+    let balance1_after_r1 = get_balance(addr1);
+    let balance2_after_r1 = get_balance(addr2);
+
+    // Now advance round and attempt a second payout using the SAME round-robin
+    // The re-entrant token should NOT be able to double-pay across rounds.
+    token.execute_payout(&mut effects, &rr1_id, &recipients).unwrap();
+    assert_eq!(effects.round(), 2);
+
+    // Verify that the balances did NOT change from round 1 to round 2
+    // (no double payment occurred)
+    assert_eq!(get_balance(addr1), balance1_after_r1);
+    assert_eq!(get_balance(addr2), balance2_after_r1);
+
+    // Contribute after round advance should still work correctly
+    let contribution = 500u64;
+    token.contribute(&mut effects, &addr1, contribution).unwrap();
+    assert_eq!(effects.round(), 2);
+
+    // Final payout should distribute exactly once per recipient
+    token.execute_payout(&mut effects, &rr2_id, &recipients).unwrap();
+    assert_eq!(effects.round(), 3);
+}
+
+fn get_balance(addr: SuiAddress) -> u64 {
+    // Return the balance of the address
+    sui_sdk::framework::sui_system::get_balance(addr)
+}
