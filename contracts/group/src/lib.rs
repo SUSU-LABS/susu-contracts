@@ -704,6 +704,7 @@ impl GroupContract {
 
     /// Full observable state of the group.
     pub fn get_group(env: Env) -> GroupState {
+        extend_instance_ttl(&env);
         let storage = env.storage().instance();
         GroupState {
             config: storage.get(&DataKey::Config).unwrap(),
@@ -718,14 +719,19 @@ impl GroupContract {
 
     /// A member's 1-based position in the payout order, or `0` if not a member.
     pub fn get_member(env: Env, address: Address) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Member(address))
-            .unwrap_or(0)
+        let key = DataKey::Member(address);
+        match env.storage().persistent().get(&key) {
+            Some(position) => {
+                extend_persistent_ttl(&env, &key);
+                position
+            }
+            None => 0,
+        }
     }
 
     /// The number of members that have joined.
     pub fn get_member_count(env: Env) -> u32 {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::MemberCount)

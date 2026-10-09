@@ -1269,6 +1269,51 @@ fn ttl_is_extended_by_an_interaction() {
 }
 
 #[test]
+fn read_view_extends_group_instance_ttl() {
+    use soroban_sdk::testutils::{Deployer as _, Ledger as _};
+    let setup = setup(2, 10 * ONE_USDC, MAX_FEE_BPS);
+
+    // Advance ledger past threshold
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(INSTANCE_TTL_THRESHOLD + 10);
+
+    // get_group read extends instance TTL
+    let state = setup.client().get_group();
+    assert_eq!(state.status, Status::Open);
+
+    let ttl = setup
+        .env
+        .deployer()
+        .get_contract_instance_ttl(&setup.group_id);
+    assert!(
+        ttl > INSTANCE_TTL_THRESHOLD,
+        "get_group read must extend instance TTL (ttl={ttl})"
+    );
+
+    // get_member_count also extends instance TTL
+    assert_eq!(setup.client().get_member_count(), 0);
+}
+
+#[test]
+fn persistent_entries_survive_past_threshold_via_read_path() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Advance sequence number past PERSISTENT_TTL_THRESHOLD
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(PERSISTENT_TTL_THRESHOLD + 10);
+
+    // Reading member extends persistent Member key and returns valid position
+    let pos = client.get_member(&setup.member(0));
+    assert_eq!(pos, 1);
+}
+
+#[test]
 fn get_round_reports_an_unstarted_round_safely() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
     let round = setup.client().get_round(&5u32);
