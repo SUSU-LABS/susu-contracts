@@ -361,3 +361,34 @@ fn set_treasury_rejects_admin_or_factory_address() {
     let res_factory = client.try_set_treasury(&factory_addr);
     assert_eq!(res_factory, Err(Ok(FactoryError::InvalidTreasury)));
 }
+
+#[test]
+fn create_group_validates_capacity_and_frequency_before_contribution_overflow() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let creator = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Zero capacity with overflowing contribution amount must return InvalidMemberCapacity
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+
+    // Out-of-bounds capacity (u32::MAX) that would overflow checked_mul must return InvalidMemberCapacity
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &u32::MAX, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+
+    // Zero frequency with overflowing contribution amount must return InvalidFrequency
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &3u32, &0u64),
+        Err(Ok(FactoryError::InvalidFrequency))
+    );
+
+    // Zero capacity with non-positive contribution must also return InvalidMemberCapacity
+    assert_eq!(
+        client.try_create_group(&creator, &token, &0i128, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+}

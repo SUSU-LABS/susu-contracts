@@ -205,18 +205,18 @@ impl FactoryContract {
         if config.paused {
             return Err(FactoryError::Paused);
         }
+        if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {
+            return Err(FactoryError::InvalidMemberCapacity);
+        }
+        if frequency_seconds == 0 {
+            return Err(FactoryError::InvalidFrequency);
+        }
         if contribution_amount <= 0
             || contribution_amount
                 .checked_mul(member_capacity as i128)
                 .is_none()
         {
             return Err(FactoryError::InvalidContributionAmount);
-        }
-        if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {
-            return Err(FactoryError::InvalidMemberCapacity);
-        }
-        if frequency_seconds == 0 {
-            return Err(FactoryError::InvalidFrequency);
         }
 
         let group_id = match storage.get::<DataKey, u32>(&DataKey::GroupCount) {
