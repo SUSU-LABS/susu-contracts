@@ -254,6 +254,8 @@ pub enum GroupError {
     SplitInvariantViolated = 19,
     /// Treasury address cannot be the group contract address.
     InvalidTreasury = 20,
+    /// Token address cannot be the group contract address.
+    InvalidToken = 21,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +359,9 @@ impl GroupContract {
         }
         if frequency_seconds == 0 {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidFrequency);
+        }
+        if token == env.current_contract_address() {
+            soroban_sdk::panic_with_error!(&env, GroupError::InvalidToken);
         }
         if treasury == env.current_contract_address() {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidTreasury);

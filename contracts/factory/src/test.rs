@@ -361,3 +361,15 @@ fn set_treasury_rejects_admin_or_factory_address() {
     let res_factory = client.try_set_treasury(&factory_addr);
     assert_eq!(res_factory, Err(Ok(FactoryError::InvalidTreasury)));
 }
+
+#[test]
+fn create_group_rejects_token_equal_to_factory() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let creator = Address::generate(&env);
+    let factory_addr = client.address.clone();
+
+    assert_eq!(
+        client.try_create_group(&creator, &factory_addr, &10_000_000i128, &3u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidToken))
+    );
+}
