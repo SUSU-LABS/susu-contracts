@@ -100,6 +100,8 @@ pub enum FactoryError {
     /// the admin can still reach `pause` and recover a contract whose instance
     /// entry has archived.
     NotInitialized = 9,
+    /// Token address cannot be the Factory itself.
+    InvalidToken = 10,
 }
 
 /// A new group contract was deployed and registered.
@@ -205,18 +207,21 @@ impl FactoryContract {
         if config.paused {
             return Err(FactoryError::Paused);
         }
-        if contribution_amount <= 0
-            || contribution_amount
-                .checked_mul(member_capacity as i128)
-                .is_none()
-        {
-            return Err(FactoryError::InvalidContributionAmount);
+        if token == env.current_contract_address() {
+            return Err(FactoryError::InvalidToken);
         }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {
             return Err(FactoryError::InvalidMemberCapacity);
         }
         if frequency_seconds == 0 {
             return Err(FactoryError::InvalidFrequency);
+        }
+        if contribution_amount <= 0
+            || contribution_amount
+                .checked_mul(member_capacity as i128)
+                .is_none()
+        {
+            return Err(FactoryError::InvalidContributionAmount);
         }
 
         let group_id = match storage.get::<DataKey, u32>(&DataKey::GroupCount) {
@@ -325,6 +330,9 @@ impl FactoryContract {
 
         let storage = env.storage().instance();
         let mut config = load_config(&env)?;
+        if config.paused {
+            return Ok(());
+        }
         config.paused = true;
         storage.set(&DataKey::Config, &config);
 
@@ -339,6 +347,9 @@ impl FactoryContract {
 
         let storage = env.storage().instance();
         let mut config = load_config(&env)?;
+        if !config.paused {
+            return Ok(());
+        }
         config.paused = false;
         storage.set(&DataKey::Config, &config);
 
