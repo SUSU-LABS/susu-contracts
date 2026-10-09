@@ -254,6 +254,8 @@ pub enum GroupError {
     SplitInvariantViolated = 19,
     /// Treasury address cannot be the group contract address.
     InvalidTreasury = 20,
+    /// A member entry in the payout order is missing or has archived.
+    MemberNotFound = 21,
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +698,8 @@ impl GroupContract {
 
     /// The immutable payout order, in join order. Position `n` (1-based) is paid in
     /// round `n`.
-    pub fn get_payout_order(env: Env) -> Vec<Address> {
+    pub fn get_payout_order(env: Env) -> Result<Vec<Address>, GroupError> {
+        extend_instance_ttl(&env);
         let count: u32 = env
             .storage()
             .instance()
@@ -706,12 +709,17 @@ impl GroupContract {
         let mut order = Vec::new(&env);
         let mut position = 1u32;
         while position <= count {
-            if let Some(address) = persistent.get(&DataKey::MemberAt(position)) {
-                order.push_back(address);
+            let key = DataKey::MemberAt(position);
+            match persistent.get(&key) {
+                Some(address) => {
+                    extend_persistent_ttl(&env, &key);
+                    order.push_back(address);
+                }
+                None => return Err(GroupError::MemberNotFound),
             }
             position += 1;
         }
-        order
+        Ok(order)
     }
 
     /// Observable state of a specific round.
