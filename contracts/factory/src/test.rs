@@ -1,4 +1,4 @@
-#![cfg(test)]
+﻿#![cfg(test)]
 
 //! Tests for the Susu Factory contract.
 //!
@@ -360,4 +360,15 @@ fn set_treasury_rejects_admin_or_factory_address() {
 
     let res_factory = client.try_set_treasury(&factory_addr);
     assert_eq!(res_factory, Err(Ok(FactoryError::InvalidTreasury)));
+}
+
+
+#[test]
+fn set_treasury_accepts_a_valid_new_treasury() {
+    let (_env, _, old_treasury, client) = setup(MAX_FEE_BPS);
+    let new_treasury = Address::generate(&_env);
+
+    assert_eq!(client.get_config().treasury, old_treasury);
+    client.set_treasury(&new_treasury);
+    assert_eq!(client.get_config().treasury, new_treasury);
 }
