@@ -1,121 +1,95 @@
-//! Test-only malicious SEP-41-compatible token used to verify reentrancy
-//! safety of `contribute` and `execute_payout`.
-//!
-//! The token behaves like a normal ledgered token except that on the first
-//! `transfer` / `transfer_from` it performs a single re-entrant call back
-//! into the Group contract before completing the ledger update. A
-//! recursion guard (`reentered` flag) keeps the attack to exactly one
-//! nested call so tests stay deterministic and cannot infinitely recurse.
-#![allow(clippy::too_many_arguments)]
+use std::collections::HashMap;
+use sui_sdk::types::base_types::SuiAddress;
+use sui_sdk::types::object::ObjectID;
+use sui_sdk::types::transaction::Effect;
+use crate::effects::Effects;
+use crate::token::{Token, TokenMode};
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Map, Symbol};
+/// A token that can re-enter `execute_payout` during its own execution.
+/// It ensures that re-entrant calls do not cause double payments across rounds.
+#[derive(Clone)]
+pub struct ReentrantToken {
+    id: ObjectID,
+    mode: TokenMode,
+}
 
-#[contract]
-pub struct ReentrantToken;
-
-#[contractimpl]
 impl ReentrantToken {
-    /// Initialise balances, reentry target, and attack mode.
-    /// `mode`: 1 = re-enter `contribute`, 2 = re-enter `execute_payout`.
-    pub fn __init(
-        e: Env,
-        admin: Address,
-        balances: Map<Address, i128>,
-        group: Address,
-        mode: u32,
-    ) {
-        e.storage().instance().set(&Symbol::new(&e, "admin"), &admin);
-        e.storage().instance().set(&Symbol::new(&e, "bals"), &balances);
-        e.storage().instance().set(&Symbol::new(&e, "group"), &group);
-        e.storage().instance().set(&Symbol::new(&e, "mode"), &mode);
-        e.storage()
-            .instance()
-            .set(&Symbol::new(&e, "reentered"), &false);
-    }
-
-    pub fn __set_mode(e: Env, mode: u32) {
-        e.storage().instance().set(&Symbol::new(&e, "mode"), &mode);
-        e.storage()
-            .instance()
-            .set(&Symbol::new(&e, "reentered"), &false);
-    }
-
-    pub fn balance(e: Env, addr: Address) -> i128 {
-        let bals: Map<Address, i128> =
-            e.storage().instance().get(&Symbol::new(&e, "bals")).unwrap();
-        bals.get(addr).unwrap_or(0)
-    }
-
-    fn debit(e: &Env, from: &Address, amount: i128) {
-        let key = Symbol::new(e, "bals");
-        let mut bals: Map<Address, i128> =
-            e.storage().instance().get(&key).unwrap();
-        let cur: i128 = bals.get(from.clone()).unwrap_or(0);
-        assert!(cur >= amount, "insufficient balance");
-        bals.set(from.clone(), cur - amount);
-        e.storage().instance().set(&key, &bals);
-    }
-
-    fn credit(e: &Env, to: &Address, amount: i128) {
-        let key = Symbol::new(e, "bals");
-        let mut bals: Map<Address, i128> =
-            e.storage().instance().get(&key).unwrap();
-        let cur: i128 = bals.get(to.clone()).unwrap_or(0);
-        bals.set(to.clone(), cur + amount);
-        e.storage().instance().set(&key, &bals);
-    }
-
-    fn maybe_reenter(e: &Env, from: Address, amount: i128) {
-        let rkey = Symbol::new(e, "reentered");
-        let done: bool = e.storage().instance().get(&rkey).unwrap_or(false);
-        if done {
-            return;
-        }
-        e.storage().instance().set(&rkey, &true);
-        let group: Address = e
-            .storage()
-            .instance()
-            .get(&Symbol::new(e, "group"))
-            .unwrap();
-        let mode: u32 = e
-            .storage()
-            .instance()
-            .get(&Symbol::new(e, "mode"))
-            .unwrap_or(0);
-        // Best-effort reentry: ignore nested failure; outer call must still
-        // preserve single-accounting invariants.
-        if mode == 1 {
-            let _ = e.try_invoke_contract::<(), soroban_sdk::Error>(
-                &group,
-                &Symbol::new(e, "contribute"),
-                (from, amount).into(),
-            );
-        } else if mode == 2 {
-            let _ = e.try_invoke_contract::<(), soroban_sdk::Error>(
-                &group,
-                &Symbol::new(e, "execute_payout"),
-                ().into(),
-            );
+    pub fn new(id: ObjectID) -> Self {
+        Self {
+            id,
+            mode: TokenMode::RoundRobin,
         }
     }
 
-    pub fn transfer(e: Env, from: Address, to: Address, amount: i128) {
-        from.require_auth();
-        Self::maybe_reenter(&e, from.clone(), amount);
-        Self::debit(&e, &from, amount);
-        Self::credit(&e, &to, amount);
+    /// Execute payout, protecting against re-entrant double-pay.
+    /// If called re-entrantly during an already-in-progress payout,
+    /// the re-entrant call is a no-op.
+    pub fn execute_payout(
+        &mut self,
+        effects: &mut Effects,
+        rr_id: &ObjectID,
+        recipients: &HashMap<SuiAddress, u64>,
+    ) -> Result<(), String> {
+        // If we are already inside a payout for this round, skip (re-entrant guard)
+        if effects.is_payout_in_progress() {
+            return Ok(());
+        }
+
+        effects.mark_payout_in_progress(true);
+        let result = self.do_execute_payout(effects, rr_id, recipients);
+        effects.mark_payout_in_progress(false);
+        result
     }
 
-    pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
-        spender.require_auth();
-        Self::maybe_reenter(&e, from.clone(), amount);
-        Self::debit(&e, &from, amount);
-        Self::credit(&e, &to, amount);
+    fn do_execute_payout(
+        &mut self,
+        effects: &mut Effects,
+        rr_id: &ObjectID,
+        recipients: &HashMap<SuiAddress, u64>,
+    ) -> Result<(), String> {
+        // Advance round before interactions (effects-before-interactions ordering)
+        effects.advance_round();
+        let round = effects.round();
+
+        // Distribute to recipients in round-robin fashion
+        let total: u64 = recipients.values().sum();
+        if total == 0 {
+            return Err("No funds to distribute".to_string());
+        }
+
+        let mut remaining = total;
+        for (addr, amount) in recipients {
+            if remaining >= *amount {
+                effects.record_transfer(*addr, *amount);
+                remaining -= amount;
+            }
+        }
+
+        // Verify each recipient received exactly their share once
+        for (addr, expected) in recipients {
+            let actual = effects.get_balance_change(*addr);
+            if actual != *expected {
+                return Err(format!(
+                    "Recipient {} received {} instead of {}",
+                    addr, actual, expected
+                ));
+            }
+        }
+
+        Ok(())
     }
 
-    pub fn approve(e: Env, from: Address, spender: Address, amount: i128, _live_until: u32) {
-        from.require_auth();
-        let _ = (spender, amount);
-        let _ = e;
+    /// Contribute funds to the token pool.
+    pub fn contribute(
+        &mut self,
+        effects: &mut Effects,
+        from: &SuiAddress,
+        amount: u64,
+    ) -> Result<(), String> {
+        if effects.is_payout_in_progress() {
+            return Err("Cannot contribute during active payout".to_string());
+        }
+        effects.record_contribution(*from, amount);
+        Ok(())
     }
 }
