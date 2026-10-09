@@ -1087,3 +1087,98 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         Err(Ok(GroupError::ArithmeticOverflow))
     );
 }
+
+/// TTL policy mirrors `lib.rs` (private there): persistent entries live
+/// 518_400 ledgers after a write or read that finds them within the
+/// 100_000-ledger extend threshold.
+const PERSISTENT_TTL_EXTEND_TO: u32 = 518_400;
+
+/// Reads a persistent entry's remaining TTL via the testutils storage API,
+/// inside the group's own contract frame.
+fn persistent_ttl(setup: &Setup, key: &DataKey) -> u32 {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    setup.env.as_contract(&setup.group_id, || {
+        setup.env.storage().persistent().get_ttl(key)
+    })
+}
+
+/// The read views extend persistent TTL, so a group that goes quiet does not
+/// lose its membership history to archival.
+///
+/// Without the `extend_persistent_ttl` calls in the read views, the TTLs below
+/// would stay at their write-time values and the second batch of assertions
+/// would observe the original expiry.
+#[test]
+fn read_paths_extend_ttl_across_idle_period() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    setup.join_all();
+    setup.client().start();
+    setup.contribute_all(1);
+    let client = setup.client();
+    let member = setup.member(0);
+
+    // Writes extend entries to ledger 518_400. Advance to the threshold
+    // boundary: 100_000 ledgers of TTL remain, so the next read must extend.
+    let idle_ledger: u32 = 418_400;
+    setup.env.ledger().set_sequence_number(idle_ledger);
+    assert_eq!(
+        persistent_ttl(&setup, &DataKey::MemberAt(1)),
+        100_000,
+        "precondition: entries sit at their write-time expiry"
+    );
+
+    // Exercise every read view named in the issue.
+    assert_eq!(client.get_member(&member), 1);
+    assert_eq!(client.get_payout_order().len(), 3);
+    let round = client.get_round(&1);
+    assert_eq!(round.contribution_count, 3);
+    assert!(client.get_pool_balance() > 0);
+    assert_eq!(client.get_current_recipient(), member);
+
+    // Each touched entry was extended to idle_ledger + 518_400.
+    for key in [
+        DataKey::Member(member.clone()),
+        DataKey::MemberAt(1),
+        DataKey::MemberAt(2),
+        DataKey::MemberAt(3),
+        DataKey::RoundPool(1),
+        DataKey::RoundContributionCount(1),
+    ] {
+        assert_eq!(
+            persistent_ttl(&setup, &key),
+            PERSISTENT_TTL_EXTEND_TO,
+            "read did not extend TTL"
+        );
+    }
+
+    // Advance past the original write-time expiry: without the extensions
+    // above, every entry would be archived here.
+    setup.env.ledger().set_sequence_number(518_401);
+    assert_eq!(client.get_payout_order().len(), 3);
+    assert_eq!(client.get_member(&member), 1);
+
+    // And the payout still works — no WrongRound from an archived MemberAt.
+    client.execute_payout();
+    assert_eq!(client.get_current_round(), 2);
+}
+
+#[test]
+fn read_views_on_never_written_keys_do_not_trap() {
+    // The `if_exists` guard: `extend_ttl` traps on missing keys, so read views
+    // must not extend blindly. Probing keys that were never written must be a
+    // quiet no-op, not a host trap.
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = GroupContractClient::new(&setup.env, &setup.group_id);
+    let stranger = Address::generate(&setup.env);
+
+    assert_eq!(client.get_member(&stranger), 0);
+    assert_eq!(client.get_payout_order().len(), 0);
+    let round = client.get_round(&99);
+    assert_eq!(round.pool, 0);
+    assert_eq!(client.get_pool_balance(), 0);
+    assert_eq!(
+        client.try_get_current_recipient(),
+        Err(Ok(GroupError::NotActive))
+    );
+}
