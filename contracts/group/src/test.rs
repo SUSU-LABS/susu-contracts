@@ -1316,13 +1316,31 @@ fn persistent_entries_survive_past_threshold_via_read_path() {
 #[test]
 fn get_round_reports_an_unstarted_round_safely() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
-    let round = setup.client().get_round(&5u32);
+    setup.join_all();
+    let client = setup.client();
 
-    assert_eq!(round.round, 5);
-    assert_eq!(round.pool, 0);
-    assert_eq!(round.contribution_count, 0);
-    assert!(!round.payout_executed);
-    assert_eq!(round.recipient, None);
+    // Before the group has started, all rounds report recipient: None
+    // even though members occupy positions 1, 2, 3 in storage.
+    assert_eq!(client.get_current_round(), 0);
+    assert_eq!(client.get_round(&1u32).recipient, None);
+    assert_eq!(client.get_round(&2u32).recipient, None);
+    assert_eq!(client.get_round(&3u32).recipient, None);
+    assert_eq!(client.get_round(&5u32).recipient, None);
+
+    // Start the group: round 1 is current, future rounds 2 and 3 remain None.
+    client.start();
+    assert_eq!(client.get_current_round(), 1);
+    assert_eq!(client.get_round(&1u32).recipient, Some(setup.member(0)));
+    assert_eq!(client.get_round(&2u32).recipient, None);
+    assert_eq!(client.get_round(&3u32).recipient, None);
+
+    // Complete round 1: round 1 retains recipient, round 2 becomes active with recipient, round 3 is None.
+    setup.contribute_all(1);
+    client.execute_payout();
+    assert_eq!(client.get_current_round(), 2);
+    assert_eq!(client.get_round(&1u32).recipient, Some(setup.member(0)));
+    assert_eq!(client.get_round(&2u32).recipient, Some(setup.member(1)));
+    assert_eq!(client.get_round(&3u32).recipient, None);
 }
 
 #[test]
