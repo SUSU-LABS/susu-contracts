@@ -49,6 +49,33 @@ fn constructor_stores_configuration() {
 }
 
 #[test]
+fn constructor_publishes_the_initial_configuration() {
+    // The constructor runs during `register`, so the constructor's events are the
+    // most recent invocation's until any other contract call is made.
+    let (env, admin, treasury, client) = setup(MAX_FEE_BPS);
+    let group_wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    let emitted = env.events().all().filter_by_contract(&client.address);
+    let expected = FactoryInitialized {
+        admin,
+        treasury,
+        fee_bps: MAX_FEE_BPS,
+        group_wasm_hash,
+    }
+    .to_xdr(&env, &client.address);
+
+    let count = emitted
+        .events()
+        .iter()
+        .filter(|event| **event == expected)
+        .count();
+    assert_eq!(
+        count, 1,
+        "the constructor must publish exactly one FactoryInitialized event"
+    );
+}
+
+#[test]
 #[should_panic]
 fn constructor_rejects_fee_above_the_protocol_maximum() {
     setup(MAX_FEE_BPS + 1);
