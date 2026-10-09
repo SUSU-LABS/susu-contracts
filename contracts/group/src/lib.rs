@@ -741,6 +741,7 @@ impl GroupContract {
     /// The immutable payout order, in join order. Position `n` (1-based) is paid in
     /// round `n`.
     pub fn get_payout_order(env: Env) -> Vec<Address> {
+        extend_instance_ttl(&env);
         let count: u32 = env
             .storage()
             .instance()
@@ -750,7 +751,11 @@ impl GroupContract {
         let mut order = Vec::new(&env);
         let mut position = 1u32;
         while position <= count {
-            if let Some(address) = persistent.get(&DataKey::MemberAt(position)) {
+            let key = DataKey::MemberAt(position);
+            if let Some(address) = persistent.get(&key) {
+                // Reading the order keeps every position alive; a quiet group whose
+                // MemberAt entries archived would silently return a short order.
+                extend_persistent_ttl(&env, &key);
                 order.push_back(address);
             }
             position += 1;
@@ -760,11 +765,31 @@ impl GroupContract {
 
     /// Observable state of a specific round.
     pub fn get_round(env: Env, round: u32) -> RoundInfo {
+        extend_instance_ttl(&env);
         let persistent = env.storage().persistent();
-        let payout_executed: bool = persistent
-            .get(&DataKey::PayoutExecuted(round))
-            .unwrap_or(false);
-        let recipient: Option<Address> = persistent.get(&DataKey::MemberAt(round));
+        let payout_key = DataKey::PayoutExecuted(round);
+        let recipient_key = DataKey::MemberAt(round);
+        let pool_key = DataKey::RoundPool(round);
+        let contribution_count_key = DataKey::RoundContributionCount(round);
+
+        let payout_executed: bool = persistent.get(&payout_key).unwrap_or(false);
+        let recipient: Option<Address> = persistent.get(&recipient_key);
+        let pool: i128 = persistent.get(&pool_key).unwrap_or(0i128);
+        let contribution_count: u32 = persistent.get(&contribution_count_key).unwrap_or(0);
+
+        // Reading a round keeps every persistent entry it touched alive, so a
+        // group that went quiet past the threshold cannot lose the round's
+        // history between observations.
+        for key in [
+            &payout_key,
+            &recipient_key,
+            &pool_key,
+            &contribution_count_key,
+        ] {
+            if persistent.has(key) {
+                extend_persistent_ttl(&env, key);
+            }
+        }
 
         // A round that has not started yet reports its phase as waiting.
         let phase = if payout_executed {
@@ -787,10 +812,8 @@ impl GroupContract {
 
         RoundInfo {
             round,
-            pool: persistent.get(&DataKey::RoundPool(round)).unwrap_or(0i128),
-            contribution_count: persistent
-                .get(&DataKey::RoundContributionCount(round))
-                .unwrap_or(0),
+            pool,
+            contribution_count,
             phase,
             payout_executed,
             recipient,
@@ -799,6 +822,7 @@ impl GroupContract {
 
     /// The member scheduled to receive the current round's payout.
     pub fn get_current_recipient(env: Env) -> Result<Address, GroupError> {
+        extend_instance_ttl(&env);
         let round: u32 = env
             .storage()
             .instance()
@@ -807,8 +831,14 @@ impl GroupContract {
         if round == 0 {
             return Err(GroupError::NotActive);
         }
-        match env.storage().persistent().get(&DataKey::MemberAt(round)) {
-            Some(address) => Ok(address),
+        let key = DataKey::MemberAt(round);
+        match env.storage().persistent().get(&key) {
+            Some(address) => {
+                // Reading the recipient keeps the entry alive; otherwise the next
+                // execute_payout after a long idle period would fail on WrongRound.
+                extend_persistent_ttl(&env, &key);
+                Ok(address)
+            }
             None => Err(GroupError::WrongRound),
         }
     }
@@ -828,6 +858,7 @@ impl GroupContract {
     /// payout. In normal operation the two are equal, because every round pays out
     /// in full.
     pub fn get_pool_balance(env: Env) -> i128 {
+        extend_instance_ttl(&env);
         let round: u32 = env
             .storage()
             .instance()
@@ -836,10 +867,13 @@ impl GroupContract {
         if round == 0 {
             return 0;
         }
-        env.storage()
-            .persistent()
-            .get(&DataKey::RoundPool(round))
-            .unwrap_or(0i128)
+        let key = DataKey::RoundPool(round);
+        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0i128);
+        if env.storage().persistent().has(&key) {
+            // Reading the pool keeps the round's balance alive across quiet periods.
+            extend_persistent_ttl(&env, &key);
+        }
+        balance
     }
 
     /// Whether every member has contributed to the current round.

@@ -1314,6 +1314,66 @@ fn persistent_entries_survive_past_threshold_via_read_path() {
 }
 
 #[test]
+fn read_views_extend_persistent_ttl_past_threshold() {
+    use soroban_sdk::testutils::{storage::Persistent as _, Ledger as _};
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    setup.contribute_all(1);
+    let client = setup.client();
+
+    let member_at_1 = DataKey::MemberAt(1u32);
+    let member_at_2 = DataKey::MemberAt(2u32);
+    let pool_key = DataKey::RoundPool(1u32);
+    let contribution_count_key = DataKey::RoundContributionCount(1u32);
+
+    let ttl_of = |key: &DataKey| {
+        setup.env.as_contract(&setup.group_id, || {
+            setup.env.storage().persistent().get_ttl(key)
+        })
+    };
+
+    // Move the ledger inside the live entries' threshold window, so the reads
+    // below are the first interaction that can extend them.
+    let ttl = ttl_of(&pool_key);
+    assert!(ttl > PERSISTENT_TTL_THRESHOLD, "precondition: entries live");
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(setup.env.ledger().sequence() + ttl - PERSISTENT_TTL_THRESHOLD + 10);
+
+    // The entries are now inside the threshold window: an unextended read path
+    // would leave them there, one ledger away from archiving.
+    let ttl_in_window = ttl_of(&pool_key);
+    assert!(
+        ttl_in_window <= PERSISTENT_TTL_THRESHOLD,
+        "precondition: pool entry inside the threshold window (ttl={ttl_in_window})"
+    );
+
+    let order = client.get_payout_order();
+    assert_eq!(order.len(), 2);
+    let round = client.get_round(&1u32);
+    assert_eq!(round.pool, 2 * setup.amount);
+    assert_eq!(round.contribution_count, 2);
+    assert_eq!(client.get_current_recipient(), setup.member(0));
+    assert_eq!(client.get_pool_balance(), 2 * setup.amount);
+
+    // Every persistent entry the reads touched is extended past the threshold
+    // again, so execute_payout after the same quiet period cannot fail on
+    // archived MemberAt/RoundPool entries.
+    for key in [
+        &member_at_1,
+        &member_at_2,
+        &pool_key,
+        &contribution_count_key,
+    ] {
+        let ttl = ttl_of(key);
+        assert!(
+            ttl > PERSISTENT_TTL_THRESHOLD,
+            "read views must extend every touched entry past the threshold (ttl={ttl})"
+        );
+    }
+}
+
+#[test]
 fn get_round_reports_an_unstarted_round_safely() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
     let round = setup.client().get_round(&5u32);
