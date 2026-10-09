@@ -74,7 +74,11 @@ fn set_fee_updates_future_groups_within_the_cap() {
     let emitted = env.events().all().filter_by_contract(&client.address);
 
     assert_eq!(client.get_config().fee_bps, 10);
-    let expected = FeeUpdated { fee_bps: 10 }.to_xdr(&env, &client.address);
+    let expected = FeeUpdated {
+        previous_fee_bps: MAX_FEE_BPS,
+        fee_bps: 10,
+    }
+    .to_xdr(&env, &client.address);
     assert!(emitted.events().contains(&expected));
 }
 
@@ -120,7 +124,7 @@ fn set_fee_requires_admin_authorization() {
 
 #[test]
 fn set_treasury_updates_future_groups() {
-    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let (env, _, treasury, client) = setup(MAX_FEE_BPS);
     let new_treasury = Address::generate(&env);
 
     client.set_treasury(&new_treasury);
@@ -129,6 +133,7 @@ fn set_treasury_updates_future_groups() {
     assert_eq!(client.get_config().treasury, new_treasury);
     let expected = TreasuryUpdated {
         treasury: new_treasury,
+        previous_treasury: treasury,
     }
     .to_xdr(&env, &client.address);
     assert!(emitted.events().contains(&expected));
@@ -175,6 +180,44 @@ fn pause_requires_admin_authorization() {
 
     assert!(client.try_pause().is_err());
     assert!(client.try_unpause().is_err());
+}
+
+#[test]
+fn pause_and_unpause_are_noop_when_state_is_unchanged() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    assert!(!client.get_config().paused);
+
+    // Initial pause: state becomes paused, emits 1 event
+    client.pause();
+    let first_pause_events = env.events().all().filter_by_contract(&client.address);
+    assert!(client.get_config().paused);
+    let expected_paused = PauseUpdated { paused: true }.to_xdr(&env, &client.address);
+    assert!(first_pause_events.events().contains(&expected_paused));
+
+    // Calling pause again while already paused: returns Ok(()), emits no new events
+    let res = client.try_pause();
+    let second_pause_events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(res, Ok(Ok(())));
+    assert!(
+        second_pause_events.events().is_empty(),
+        "second pause must not emit PauseUpdated"
+    );
+
+    // Initial unpause: state becomes unpaused, emits 1 event
+    client.unpause();
+    let first_unpause_events = env.events().all().filter_by_contract(&client.address);
+    assert!(!client.get_config().paused);
+    let expected_unpaused = PauseUpdated { paused: false }.to_xdr(&env, &client.address);
+    assert!(first_unpause_events.events().contains(&expected_unpaused));
+
+    // Calling unpause again while already unpaused: returns Ok(()), emits no new events
+    let res_unpause = client.try_unpause();
+    let second_unpause_events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(res_unpause, Ok(Ok(())));
+    assert!(
+        second_unpause_events.events().is_empty(),
+        "second unpause must not emit PauseUpdated"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +364,16 @@ fn create_group_rejects_invalid_parameters() {
         client.try_create_group(&creator, &token, &10_000_000i128, &3u32, &0u64),
         Err(Ok(FactoryError::InvalidFrequency))
     );
+    assert_eq!(
+        client.try_create_group(
+            &creator,
+            &client.address,
+            &10_000_000i128,
+            &3u32,
+            &604_800u64
+        ),
+        Err(Ok(FactoryError::InvalidToken))
+    );
 }
 
 #[test]
@@ -351,8 +404,23 @@ fn constructor_rejects_treasury_equal_to_admin() {
 }
 
 #[test]
+#[should_panic]
+fn constructor_rejects_treasury_equal_to_factory() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let factory_id = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    env.register_at(
+        &factory_id,
+        FactoryContract,
+        (admin, wasm_hash, factory_id.clone(), MAX_FEE_BPS),
+    );
+}
+
+#[test]
 fn set_treasury_rejects_admin_or_factory_address() {
-    let (_env, admin, _, client) = setup(MAX_FEE_BPS);
+    let (env, admin, initial_treasury, client) = setup(MAX_FEE_BPS);
     let factory_addr = client.address.clone();
 
     let res_admin = client.try_set_treasury(&admin);
@@ -360,4 +428,12 @@ fn set_treasury_rejects_admin_or_factory_address() {
 
     let res_factory = client.try_set_treasury(&factory_addr);
     assert_eq!(res_factory, Err(Ok(FactoryError::InvalidTreasury)));
+
+    // Treasury remains unchanged after failed attempts
+    assert_eq!(client.get_config().treasury, initial_treasury);
+
+    // A valid treasury still succeeds
+    let valid_treasury = Address::generate(&env);
+    assert!(client.try_set_treasury(&valid_treasury).is_ok());
+    assert_eq!(client.get_config().treasury, valid_treasury);
 }

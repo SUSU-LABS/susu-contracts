@@ -100,6 +100,8 @@ pub enum FactoryError {
     /// the admin can still reach `pause` and recover a contract whose instance
     /// entry has archived.
     NotInitialized = 9,
+    /// Token address cannot be the Factory itself.
+    InvalidToken = 10,
 }
 
 /// A new group contract was deployed and registered.
@@ -123,6 +125,7 @@ pub struct GroupCreated {
 #[contractevent(topics = ["susu", "fee_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeUpdated {
+    pub previous_fee_bps: u32,
     pub fee_bps: u32,
 }
 
@@ -132,6 +135,7 @@ pub struct FeeUpdated {
 pub struct TreasuryUpdated {
     #[topic]
     pub treasury: Address,
+    pub previous_treasury: Address,
 }
 
 /// New group creation was paused or unpaused.
@@ -204,6 +208,9 @@ impl FactoryContract {
 
         if config.paused {
             return Err(FactoryError::Paused);
+        }
+        if token == env.current_contract_address() {
+            return Err(FactoryError::InvalidToken);
         }
         if contribution_amount <= 0
             || contribution_amount
@@ -287,10 +294,15 @@ impl FactoryContract {
 
         let storage = env.storage().instance();
         let mut config = load_config(&env)?;
+        let previous_fee_bps = config.fee_bps;
         config.fee_bps = fee_bps;
         storage.set(&DataKey::Config, &config);
 
-        FeeUpdated { fee_bps }.publish(&env);
+        FeeUpdated {
+            previous_fee_bps,
+            fee_bps,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -307,10 +319,15 @@ impl FactoryContract {
         if treasury == config.admin || treasury == env.current_contract_address() {
             return Err(FactoryError::InvalidTreasury);
         }
+        let previous_treasury = config.treasury.clone();
         config.treasury = treasury.clone();
         storage.set(&DataKey::Config, &config);
 
-        TreasuryUpdated { treasury }.publish(&env);
+        TreasuryUpdated {
+            treasury,
+            previous_treasury,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -325,6 +342,9 @@ impl FactoryContract {
 
         let storage = env.storage().instance();
         let mut config = load_config(&env)?;
+        if config.paused {
+            return Ok(());
+        }
         config.paused = true;
         storage.set(&DataKey::Config, &config);
 
@@ -339,6 +359,9 @@ impl FactoryContract {
 
         let storage = env.storage().instance();
         let mut config = load_config(&env)?;
+        if !config.paused {
+            return Ok(());
+        }
         config.paused = false;
         storage.set(&DataKey::Config, &config);
 
