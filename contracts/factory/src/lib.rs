@@ -143,6 +143,23 @@ pub struct PauseUpdated {
     pub paused: bool,
 }
 
+/// The Factory was deployed with this configuration.
+///
+/// Published exactly once, from the constructor, so the initial admin,
+/// treasury, fee and group wasm hash are observable from chain history the
+/// same way every later change is through `FeeUpdated`/`TreasuryUpdated`/
+/// `PauseUpdated`. `admin` is a topic so an indexer can key deployments by
+/// operator; the rest rides in data (four topics would be the limit).
+#[contractevent(topics = ["susu", "factory_initialized"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactoryInitialized {
+    #[topic]
+    pub admin: Address,
+    pub treasury: Address,
+    pub fee_bps: u32,
+    pub group_wasm_hash: BytesN<32>,
+}
+
 /// The Susu Factory contract type.
 #[contract]
 pub struct FactoryContract;
@@ -170,14 +187,22 @@ impl FactoryContract {
             soroban_sdk::panic_with_error!(&env, FactoryError::InvalidTreasury);
         }
         let config = FactoryConfig {
-            admin,
-            treasury,
+            admin: admin.clone(),
+            treasury: treasury.clone(),
             fee_bps,
-            group_wasm_hash,
+            group_wasm_hash: group_wasm_hash.clone(),
             paused: false,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::GroupCount, &0u32);
+
+        FactoryInitialized {
+            admin,
+            treasury,
+            fee_bps,
+            group_wasm_hash,
+        }
+        .publish(&env);
     }
 
     /// Deploy and register a new group.
