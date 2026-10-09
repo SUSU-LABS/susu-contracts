@@ -156,6 +156,30 @@ fn constructor_stores_configuration_and_opens_the_group() {
     assert_eq!(state.member_count, 0);
     assert_eq!(client.get_token(), setup.token);
     assert_eq!(client.version(), 2);
+
+    let emitted = setup.env.events().all().filter_by_contract(&setup.group_id);
+    let expected = GroupInitialized {
+        token: setup.token.clone(),
+        treasury: setup.treasury.clone(),
+        contribution_amount: 10 * ONE_USDC,
+        member_capacity: 3,
+        frequency_seconds: ONE_WEEK,
+        fee_bps: MAX_FEE_BPS,
+    }
+    .to_xdr(&setup.env, &setup.group_id);
+
+    assert!(
+        emitted.events().contains(&expected),
+        "constructor must emit GroupInitialized event"
+    );
+
+    let mut count = 0;
+    for e in emitted.events().into_iter() {
+        if e == expected {
+            count += 1;
+        }
+    }
+    assert_eq!(count, 1, "event must be emitted exactly once");
 }
 
 #[test]

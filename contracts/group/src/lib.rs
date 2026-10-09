@@ -275,6 +275,18 @@ pub struct MemberJoined {
     pub position: u32,
 }
 
+/// The group was initialized with its immutable configuration.
+#[contractevent(topics = ["susu", "initialized"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupInitialized {
+    pub token: Address,
+    pub treasury: Address,
+    pub contribution_amount: i128,
+    pub member_capacity: u32,
+    pub frequency_seconds: u64,
+    pub fee_bps: u32,
+}
+
 /// The group reached capacity and started running rounds.
 #[contractevent(topics = ["susu", "start"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -414,10 +426,6 @@ impl GroupContract {
         extend_instance_ttl(&env);
 
         GroupInitialized {
-            factory: config.factory.clone(),
-            creator: config.creator.clone(),
-            token: config.token.clone(),
-            treasury: config.treasury.clone(),
             contribution_amount: config.contribution_amount,
             member_capacity: config.member_capacity,
             frequency_seconds: config.frequency_seconds,
