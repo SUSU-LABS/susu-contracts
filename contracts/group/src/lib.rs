@@ -679,7 +679,11 @@ impl GroupContract {
     }
 
     /// A member's 1-based position in the payout order, or `0` if not a member.
+    ///
+    /// Extends the entry's TTL: a read keeps the group's own history alive,
+    /// so long-running rounds cannot archive it.
     pub fn get_member(env: Env, address: Address) -> u32 {
+        extend_persistent_ttl_if_exists(&env, &DataKey::Member(address.clone()));
         env.storage()
             .persistent()
             .get(&DataKey::Member(address))
@@ -688,6 +692,7 @@ impl GroupContract {
 
     /// The number of members that have joined.
     pub fn get_member_count(env: Env) -> u32 {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::MemberCount)
@@ -696,7 +701,12 @@ impl GroupContract {
 
     /// The immutable payout order, in join order. Position `n` (1-based) is paid in
     /// round `n`.
+    ///
+    /// Extends the TTL of the instance and of each existing `MemberAt` entry it
+    /// touches: a read keeps the group's own history alive, so long-running
+    /// rounds cannot archive it.
     pub fn get_payout_order(env: Env) -> Vec<Address> {
+        extend_instance_ttl(&env);
         let count: u32 = env
             .storage()
             .instance()
@@ -706,7 +716,9 @@ impl GroupContract {
         let mut order = Vec::new(&env);
         let mut position = 1u32;
         while position <= count {
-            if let Some(address) = persistent.get(&DataKey::MemberAt(position)) {
+            let key = DataKey::MemberAt(position);
+            if let Some(address) = persistent.get(&key) {
+                extend_persistent_ttl(&env, &key);
                 order.push_back(address);
             }
             position += 1;
@@ -715,7 +727,15 @@ impl GroupContract {
     }
 
     /// Observable state of a specific round.
+    ///
+    /// Extends every touched entry's TTL: a read keeps the group's own history
+    /// alive, so long-running rounds cannot archive it.
     pub fn get_round(env: Env, round: u32) -> RoundInfo {
+        extend_instance_ttl(&env);
+        extend_persistent_ttl_if_exists(&env, &DataKey::PayoutExecuted(round));
+        extend_persistent_ttl_if_exists(&env, &DataKey::MemberAt(round));
+        extend_persistent_ttl_if_exists(&env, &DataKey::RoundPool(round));
+        extend_persistent_ttl_if_exists(&env, &DataKey::RoundContributionCount(round));
         let persistent = env.storage().persistent();
         let payout_executed: bool = persistent
             .get(&DataKey::PayoutExecuted(round))
@@ -754,7 +774,11 @@ impl GroupContract {
     }
 
     /// The member scheduled to receive the current round's payout.
+    ///
+    /// Extends the touched entries' TTL: a read keeps the group's own history
+    /// alive, so long-running rounds cannot archive it.
     pub fn get_current_recipient(env: Env) -> Result<Address, GroupError> {
+        extend_instance_ttl(&env);
         let round: u32 = env
             .storage()
             .instance()
@@ -763,6 +787,7 @@ impl GroupContract {
         if round == 0 {
             return Err(GroupError::NotActive);
         }
+        extend_persistent_ttl_if_exists(&env, &DataKey::MemberAt(round));
         match env.storage().persistent().get(&DataKey::MemberAt(round)) {
             Some(address) => Ok(address),
             None => Err(GroupError::WrongRound),
@@ -771,6 +796,7 @@ impl GroupContract {
 
     /// The current round number, or `0` before the group starts.
     pub fn get_current_round(env: Env) -> u32 {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::CurrentRound)
@@ -783,7 +809,11 @@ impl GroupContract {
     /// token balance, so a stray transfer into the contract cannot inflate a
     /// payout. In normal operation the two are equal, because every round pays out
     /// in full.
+    ///
+    /// Extends the touched entries' TTL: a read keeps the group's own history
+    /// alive, so long-running rounds cannot archive it.
     pub fn get_pool_balance(env: Env) -> i128 {
+        extend_instance_ttl(&env);
         let round: u32 = env
             .storage()
             .instance()
@@ -792,6 +822,7 @@ impl GroupContract {
         if round == 0 {
             return 0;
         }
+        extend_persistent_ttl_if_exists(&env, &DataKey::RoundPool(round));
         env.storage()
             .persistent()
             .get(&DataKey::RoundPool(round))
@@ -871,6 +902,17 @@ fn extend_persistent_ttl(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+/// Extends a persistent entry's TTL when the entry exists.
+///
+/// The host's `extend_ttl` traps on missing keys, so read views — which
+/// routinely probe keys that may not exist yet (a round not yet paid out, an
+/// address that never joined) — must check first.
+fn extend_persistent_ttl_if_exists(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        extend_persistent_ttl(env, key);
+    }
 }
 
 mod test;
