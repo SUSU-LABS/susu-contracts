@@ -254,6 +254,10 @@ pub enum GroupError {
     SplitInvariantViolated = 19,
     /// Treasury address cannot be the group contract address.
     InvalidTreasury = 20,
+    /// A `MemberAt` position is missing from persistent storage (archived).
+    /// The payout order cannot be reconstructed, so it fails loudly instead
+    /// of silently returning a truncated list.
+    PayoutOrderIncomplete = 21,
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +700,12 @@ impl GroupContract {
 
     /// The immutable payout order, in join order. Position `n` (1-based) is paid in
     /// round `n`.
-    pub fn get_payout_order(env: Env) -> Vec<Address> {
+    ///
+    /// Returns [`GroupError::PayoutOrderIncomplete`] if any position's entry is
+    /// missing from persistent storage (archived). A truncated list would let an
+    /// off-chain consumer mistake the group for a smaller one, so the failure is
+    /// loud rather than silent.
+    pub fn get_payout_order(env: Env) -> Result<Vec<Address>, GroupError> {
         let count: u32 = env
             .storage()
             .instance()
@@ -706,12 +715,13 @@ impl GroupContract {
         let mut order = Vec::new(&env);
         let mut position = 1u32;
         while position <= count {
-            if let Some(address) = persistent.get(&DataKey::MemberAt(position)) {
-                order.push_back(address);
+            match persistent.get(&DataKey::MemberAt(position)) {
+                Some(address) => order.push_back(address),
+                None => return Err(GroupError::PayoutOrderIncomplete),
             }
             position += 1;
         }
-        order
+        Ok(order)
     }
 
     /// Observable state of a specific round.

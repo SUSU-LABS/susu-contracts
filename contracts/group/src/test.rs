@@ -431,7 +431,7 @@ fn join_assigns_sequential_positions_and_is_emitted() {
         &setup.env,
         [setup.member(0), setup.member(1), setup.member(2)],
     );
-    assert_eq!(client.get_payout_order(), expected_order);
+    assert_eq!(client.try_get_payout_order(), Ok(Ok(expected_order)));
 
     let expected = MemberJoined {
         member: setup.member(1),
@@ -455,6 +455,35 @@ fn join_assigns_sequential_positions_and_is_emitted() {
         .filter_by_contract(&setup.group_id)
         .events()
         .contains(&first_expected));
+}
+
+#[test]
+fn get_payout_order_fails_loudly_when_a_position_is_archived() {
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    setup.join_all();
+
+    // Sanity: the full order resolves before any archival.
+    assert_eq!(client.try_get_payout_order(), Ok(Ok(Vec::from_array(
+        &setup.env,
+        [setup.member(0), setup.member(1), setup.member(2)],
+    ))));
+
+    // Simulate an archived `MemberAt` entry by removing it from persistent
+    // storage directly. The old code silently skipped the missing position
+    // and returned a 2-element vec; the fix must fail loudly instead.
+    setup.env.as_contract(&setup.group_id, || {
+        setup
+            .env
+            .storage()
+            .persistent()
+            .remove(&DataKey::MemberAt(2));
+    });
+
+    assert_eq!(
+        client.try_get_payout_order(),
+        Err(Ok(GroupError::PayoutOrderIncomplete))
+    );
 }
 
 #[test]
