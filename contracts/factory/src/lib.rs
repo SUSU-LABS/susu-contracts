@@ -374,6 +374,7 @@ impl FactoryContract {
 
     /// The address of a group by id.
     pub fn get_group(env: Env, group_id: u32) -> Result<Address, FactoryError> {
+        extend_instance_ttl(&env);
         let key = DataKey::Group(group_id);
         match env.storage().persistent().get(&key) {
             Some(address) => {
