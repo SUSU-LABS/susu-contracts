@@ -1336,6 +1336,7 @@ fn read_views_extend_persistent_ttl_past_threshold() {
     use soroban_sdk::testutils::Ledger as _;
     let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
     let client = setup.client();
+    setup.contribute_all(1);
     let written_at = setup.env.ledger().sequence();
 
     // Advance ledger until TTL drops below threshold
@@ -1361,15 +1362,6 @@ fn read_views_extend_persistent_ttl_past_threshold() {
         member_at_ttl(&setup.env, &setup.group_id, 2),
         PERSISTENT_TTL_EXTEND_TO,
         "get_payout_order did not extend MemberAt TTL for position 2"
-    );
-
-    // Contribute round 1 funds
-    setup.contribute_all(1);
-
-    // Advance again near threshold
-    let round1_written_at = setup.env.ledger().sequence();
-    setup.env.ledger().set_sequence_number(
-        round1_written_at + PERSISTENT_TTL_EXTEND_TO - PERSISTENT_TTL_THRESHOLD + 1,
     );
 
     // get_round extends round-related persistent keys
