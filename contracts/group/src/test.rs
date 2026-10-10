@@ -464,10 +464,13 @@ fn get_payout_order_fails_loudly_when_a_position_is_archived() {
     setup.join_all();
 
     // Sanity: the full order resolves before any archival.
-    assert_eq!(client.try_get_payout_order(), Ok(Ok(Vec::from_array(
-        &setup.env,
-        [setup.member(0), setup.member(1), setup.member(2)],
-    ))));
+    assert_eq!(
+        client.try_get_payout_order(),
+        Ok(Ok(Vec::from_array(
+            &setup.env,
+            [setup.member(0), setup.member(1), setup.member(2)],
+        )))
+    );
 
     // Simulate an archived `MemberAt` entry by removing it from persistent
     // storage directly. The old code silently skipped the missing position
