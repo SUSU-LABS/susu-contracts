@@ -166,7 +166,8 @@ pub struct RoundInfo {
     pub contribution_count: u32,
     pub phase: RoundPhase,
     pub payout_executed: bool,
-    /// The scheduled recipient. `None` for a round that does not exist yet.
+    /// The scheduled recipient. `None` for a round that has not started yet
+    /// (a future round) or does not exist.
     pub recipient: Option<Address>,
 }
 
@@ -764,25 +765,33 @@ impl GroupContract {
         let payout_executed: bool = persistent
             .get(&DataKey::PayoutExecuted(round))
             .unwrap_or(false);
-        let recipient: Option<Address> = persistent.get(&DataKey::MemberAt(round));
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        // The payout order is fixed at join time, but a round that has not
+        // started yet has no observable recipient: `recipient` is `None` for
+        // future rounds, as documented on `RoundInfo`. A round whose payout
+        // already executed keeps its recipient so completed rounds stay
+        // auditable.
+        let recipient: Option<Address> = if !payout_executed && round > current_round {
+            None
+        } else {
+            persistent.get(&DataKey::MemberAt(round))
+        };
 
         // A round that has not started yet reports its phase as waiting.
         let phase = if payout_executed {
             RoundPhase::PayoutExecuted
-        } else {
-            let current_round: u32 = env
-                .storage()
+        } else if round == current_round {
+            env.storage()
                 .instance()
-                .get(&DataKey::CurrentRound)
-                .unwrap_or(0);
-            if round == current_round {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::RoundPhase)
-                    .unwrap_or(RoundPhase::WaitingForContributions)
-            } else {
-                RoundPhase::WaitingForContributions
-            }
+                .get(&DataKey::RoundPhase)
+                .unwrap_or(RoundPhase::WaitingForContributions)
+        } else {
+            RoundPhase::WaitingForContributions
         };
 
         RoundInfo {

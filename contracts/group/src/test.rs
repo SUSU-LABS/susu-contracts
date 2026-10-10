@@ -1326,6 +1326,50 @@ fn get_round_reports_an_unstarted_round_safely() {
 }
 
 #[test]
+fn get_round_returns_no_recipient_for_future_rounds() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Round 1 is the current round: its scheduled recipient is observable.
+    assert_eq!(client.get_round(&1u32).recipient, Some(setup.member(0)));
+
+    // Rounds 2 and 3 have not started yet: no observable recipient, even
+    // though the payout order is already fixed at join time.
+    let round2 = client.get_round(&2u32);
+    assert_eq!(round2.recipient, None);
+    assert_eq!(round2.phase, RoundPhase::WaitingForContributions);
+    assert!(!round2.payout_executed);
+
+    let round3 = client.get_round(&3u32);
+    assert_eq!(round3.recipient, None);
+    assert_eq!(round3.phase, RoundPhase::WaitingForContributions);
+    assert!(!round3.payout_executed);
+}
+
+#[test]
+fn get_round_keeps_recipient_for_completed_and_current_rounds() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Complete round 1.
+    setup.contribute_all(1);
+    client.execute_payout();
+
+    // The completed round keeps its recipient for auditability.
+    let round1 = client.get_round(&1u32);
+    assert!(round1.payout_executed);
+    assert_eq!(round1.recipient, Some(setup.member(0)));
+
+    // Round 2 is now current: its recipient is observable.
+    let round2 = client.get_round(&2u32);
+    assert!(!round2.payout_executed);
+    assert_eq!(round2.recipient, Some(setup.member(1)));
+
+    // Round 3 is still in the future: no recipient.
+    assert_eq!(client.get_round(&3u32).recipient, None);
+}
+
+#[test]
 fn get_pool_balance_is_zero_before_the_group_starts() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
     assert_eq!(setup.client().get_pool_balance(), 0);
