@@ -13,7 +13,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
-    token, Event, Vec,
+    token, vec, Event, IntoVal, Map, Symbol, Vec,
 };
 
 /// 1 USDC in stroops (7 decimals).
@@ -1436,4 +1436,248 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         client.try_contribute(&setup.member(0), &setup.amount, &1u32),
         Err(Ok(GroupError::ArithmeticOverflow))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Reentrancy across rounds (#44)
+// ---------------------------------------------------------------------------
+
+/// Fixture: a group whose token is the malicious `ReentrantToken` in `mode`,
+/// with every member funded in the token's own ledger.
+struct ReentrantSetup {
+    env: Env,
+    group_id: Address,
+    token_id: Address,
+    treasury: Address,
+    members: Vec<Address>,
+    amount: i128,
+    capacity: u32,
+}
+
+fn setup_reentrant(mode: u32) -> ReentrantSetup {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_id = env.register(reentrant_token::ReentrantToken, ());
+
+    let capacity = 3u32;
+    let amount = 10 * ONE_USDC;
+
+    let mut members = Vec::new(&env);
+    let mut bals = Map::new(&env);
+    let mut i = 0;
+    while i < capacity {
+        let member = Address::generate(&env);
+        bals.set(member.clone(), amount * 5);
+        members.push_back(member);
+        i += 1;
+    }
+
+    // The token must exist before the group (constructor takes its address);
+    // the token is pointed back at the group right after, before any transfer.
+    let group_id = env.register(
+        GroupContract,
+        (
+            Address::generate(&env), // factory (informational)
+            Address::generate(&env), // creator (informational, no authority)
+            token_id.clone(),
+            treasury.clone(),
+            amount,
+            capacity,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+    env.invoke_contract::<()>(
+        &token_id,
+        &Symbol::new(&env, "init"),
+        vec![
+            &env,
+            admin.into_val(&env),
+            bals.into_val(&env),
+            group_id.clone().into_val(&env),
+            mode.into_val(&env),
+        ],
+    );
+
+    ReentrantSetup {
+        env,
+        group_id,
+        token_id,
+        treasury,
+        members,
+        amount,
+        capacity,
+    }
+}
+
+/// A re-entrant token that attacks *across* the round boundary: during round
+/// N's payout transfer it re-enters `execute_payout` (which must fail — the
+/// effects have already advanced the round). Afterwards the run must be
+/// indistinguishable from a clean run performing the same logical operations.
+///
+/// Note: a nested `contribute` is not attempted — `require_auth` cannot be
+/// mocked in the nested `try_invoke_contract` context, so the test env aborts
+/// it for framework reasons unrelated to the protection under test.
+#[test]
+fn execute_payout_reentrant_across_rounds_no_double_pay() {
+    // ---- attack run -------------------------------------------------------
+    // Start disarmed (mode 0) so the honest contribute_all transfers do not
+    // trip the reentrancy guard; arm mode 3 right before execute_payout.
+    let attack = setup_reentrant(0);
+    let a_client = GroupContractClient::new(&attack.env, &attack.group_id);
+    let a_token = token::Client::new(&attack.env, &attack.token_id);
+
+    let mut i = 0;
+    while i < attack.capacity {
+        a_client.join(&attack.members.get(i).unwrap());
+        i += 1;
+    }
+    a_client.start();
+    let mut j = 0;
+    while j < attack.capacity {
+        a_client.contribute(&attack.members.get(j).unwrap(), &attack.amount, &1);
+        j += 1;
+    }
+    // Arm mode 3 so the re-entry fires during execute_payout.
+    attack.env.invoke_contract::<()>(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "set_mode"),
+        vec![&attack.env, 3u32.into_val(&attack.env)],
+    );
+
+    let recipient = attack.members.get(0).unwrap();
+    let recipient_before = a_token.balance(&recipient);
+    let treasury_before = a_token.balance(&attack.treasury);
+
+    // Round 1 payout; the token re-enters mid-transfer.
+    a_client.execute_payout();
+
+    // Capture events immediately: events().all() only returns the events of
+    // the LAST contract invocation, so this must precede any other call
+    // (even a balance read).
+    let emitted = attack
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&attack.group_id);
+    let pool = 3 * attack.amount;
+    let fee = pool * (MAX_FEE_BPS as i128) / 10_000;
+    let recipient_amount = pool - fee;
+    let expected_payout = PayoutExecuted {
+        recipient: recipient.clone(),
+        round: 1,
+        recipient_amount,
+    }
+    .to_xdr(&attack.env, &attack.group_id);
+    let mut payout_event_count = 0;
+    for e in emitted.events().iter() {
+        if *e == expected_payout {
+            payout_event_count += 1;
+        }
+    }
+    assert_eq!(
+        payout_event_count, 1,
+        "expected exactly one PayoutExecuted event for round 1"
+    );
+
+    // The nested re-entrant payout must have been cleanly rejected with a
+    // contract error (code 4), proving the round had already advanced past
+    // payout when the token re-entered. Success (1) would mean double payout;
+    // abort (200) would mean the guard failed differently.
+    let nested_code: u32 = attack.env.invoke_contract(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "get_nested_result"),
+        vec![&attack.env],
+    );
+    assert_eq!(
+        nested_code, 4,
+        "nested execute_payout should be rejected with a contract error"
+    );
+
+    // Exactly one payout for round 1, to the scheduled recipient.
+    assert_eq!(
+        a_token.balance(&recipient),
+        recipient_before + recipient_amount,
+        "round 1 paid out more than once"
+    );
+    assert_eq!(a_token.balance(&attack.treasury), treasury_before + fee);
+
+    // Round 2 was not paid early or twice: still collecting.
+    assert_eq!(a_client.get_current_round(), 2);
+    assert_eq!(
+        a_client.get_group().round_phase,
+        RoundPhase::WaitingForContributions
+    );
+    assert_eq!(
+        a_client.get_round(&2u32).phase,
+        RoundPhase::WaitingForContributions
+    );
+
+    // Finish round 2 honestly: all three contribute, then it must pay out
+    // exactly once, to member 2 (join order second).
+    a_client.contribute(&attack.members.get(0).unwrap(), &attack.amount, &2u32);
+    a_client.contribute(&attack.members.get(1).unwrap(), &attack.amount, &2u32);
+    a_client.contribute(&attack.members.get(2).unwrap(), &attack.amount, &2u32);
+    let r2_recipient = attack.members.get(1).unwrap();
+    let r2_before = a_token.balance(&r2_recipient);
+    a_client.execute_payout();
+    assert_eq!(
+        a_token.balance(&r2_recipient),
+        r2_before + recipient_amount,
+        "round 2 paid out more than once"
+    );
+    assert_eq!(a_client.get_current_round(), 3);
+
+    // ---- control run: same logical operations, passive token --------------
+    let control = setup_reentrant(0);
+    let c_client = GroupContractClient::new(&control.env, &control.group_id);
+    let c_token = token::Client::new(&control.env, &control.token_id);
+
+    let mut k = 0;
+    while k < control.capacity {
+        c_client.join(&control.members.get(k).unwrap());
+        k += 1;
+    }
+    c_client.start();
+    let mut m = 0;
+    while m < control.capacity {
+        c_client.contribute(&control.members.get(m).unwrap(), &control.amount, &1);
+        m += 1;
+    }
+    c_client.execute_payout();
+    // Round 2: all three contribute, then payout.
+    c_client.contribute(&control.members.get(0).unwrap(), &control.amount, &2u32);
+    c_client.contribute(&control.members.get(1).unwrap(), &control.amount, &2u32);
+    c_client.contribute(&control.members.get(2).unwrap(), &control.amount, &2u32);
+    c_client.execute_payout();
+
+    // ---- the attack run matches the clean run ------------------------------
+    let mut n = 0;
+    while n < attack.capacity {
+        assert_eq!(
+            a_token.balance(&attack.members.get(n).unwrap()),
+            c_token.balance(&control.members.get(n).unwrap()),
+            "member balance mismatch after cross-round attack"
+        );
+        n += 1;
+    }
+    assert_eq!(
+        a_token.balance(&attack.treasury),
+        c_token.balance(&control.treasury),
+        "treasury balance mismatch after cross-round attack"
+    );
+    assert_eq!(
+        a_token.balance(&attack.group_id),
+        c_token.balance(&control.group_id),
+        "group balance mismatch (extra funding for regression)"
+    );
+    assert_eq!(a_client.get_current_round(), c_client.get_current_round());
+    assert_eq!(
+        a_client.get_group().round_phase,
+        c_client.get_group().round_phase
+    );
+    assert_eq!(a_client.get_pool_balance(), c_client.get_pool_balance());
 }
