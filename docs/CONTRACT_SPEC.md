@@ -192,7 +192,7 @@ emitting `PayoutExecuted` and `FeePaid`.
 | `get_group()` | `GroupState` — config, status, round, member count, phase |
 | `get_member(address)` | `u32` — 1-based position, or `0` if not a member |
 | `get_member_count()` | `u32` |
-| `get_payout_order()` | `Vec<Address>` — the immutable payout order |
+| `get_payout_order()` | `Result<Vec<Address>, GroupError>` — the immutable payout order; `PayoutOrderIncomplete` if a stored position is missing |
 | `get_round(round)` | `RoundInfo` — pool, contribution count, phase, recipient |
 | `get_current_recipient()` | `Result<Address, GroupError>` |
 | `get_current_round()` | `u32` — 1-based; `0` before start |
@@ -209,7 +209,8 @@ emitting `PayoutExecuted` and `FeePaid`.
 `CapacityNotReached = 8`, `NotActive = 9`, `NotAMember = 10`, `WrongRound = 11`,
 `WrongAmount = 12`, `AlreadyContributed = 13`, `ContributionsIncomplete = 14`,
 `PayoutAlreadyExecuted = 15`, `WrongRoundPhase = 16`, `GroupCompleted = 17`,
-`ArithmeticOverflow = 18`, `SplitInvariantViolated = 19`.
+`ArithmeticOverflow = 18`, `SplitInvariantViolated = 19`, `InvalidTreasury = 20`,
+`InvalidToken = 21`, `PayoutOrderIncomplete = 22`.
 
 ---
 
