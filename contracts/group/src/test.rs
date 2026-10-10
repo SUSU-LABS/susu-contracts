@@ -1437,3 +1437,26 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         Err(Ok(GroupError::ArithmeticOverflow))
     );
 }
+
+#[test]
+fn get_payout_order_fails_loudly_when_member_entry_is_missing() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    assert_eq!(client.get_payout_order().len(), 3);
+
+    // Simulate an archived / missing MemberAt persistent entry
+    setup.env.as_contract(&setup.group_id, || {
+        setup
+            .env
+            .storage()
+            .persistent()
+            .remove(&DataKey::MemberAt(2));
+    });
+
+    // Must return PayoutOrderIncomplete rather than silently returning a shortened Vec
+    assert_eq!(
+        client.try_get_payout_order(),
+        Err(Ok(GroupError::PayoutOrderIncomplete))
+    );
+}
