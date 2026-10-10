@@ -3,7 +3,7 @@
 //!
 //! Attack modes: 1 = re-enter `contribute`, 2/3 = re-enter `execute_payout`.
 //! The nested outcome is recorded as a sentinel code retrievable via
-//! `get_nested_result` (1 = nested success, 4 = contract error,
+//! `get_nested_result` (1 = nested success, 4 = invocation error,
 //! 200 = host abort).
 //!
 //! The token behaves like a normal ledgered token except that on the first
@@ -43,6 +43,19 @@ impl ReentrantToken {
         e.storage()
             .instance()
             .set(&Symbol::new(&e, "reentered"), &false);
+    }
+
+    pub fn expect_round(e: Env, round: u32) {
+        e.storage()
+            .instance()
+            .set(&Symbol::new(&e, "expected_round"), &round);
+    }
+
+    pub fn observed_paid(e: Env) -> bool {
+        e.storage()
+            .instance()
+            .get(&Symbol::new(&e, "observed_paid"))
+            .unwrap()
     }
 
     pub fn balance(e: Env, addr: Address) -> i128 {
@@ -88,11 +101,30 @@ impl ReentrantToken {
             .instance()
             .get(&Symbol::new(e, "mode"))
             .unwrap_or(0);
+        if mode == 3 {
+            // Test-environment probe at the external transfer boundary. The host
+            // can reject re-entry independently of our effects ordering, so the
+            // nested error alone cannot establish effects-before-interactions.
+            let expected: u32 = e
+                .storage()
+                .instance()
+                .get(&Symbol::new(e, "expected_round"))
+                .unwrap();
+            let paid: bool = e.as_contract(&group, || {
+                e.storage()
+                    .persistent()
+                    .get(&super::DataKey::PayoutExecuted(expected))
+                    .unwrap_or(false)
+            });
+            e.storage()
+                .instance()
+                .set(&Symbol::new(e, "observed_paid"), &paid);
+        }
         // Best-effort reentry: record the nested outcome; outer call must still
         // preserve single-accounting invariants.
         // Sentinel codes for get_nested_result():
         //   1 = nested call succeeded (double payout — the bug under test)
-        //   4 = nested call cleanly rejected with a contract error
+        //   4 = nested invocation returned an error
         // 200 = nested call aborted at the host level
         let args: Vec<Val>;
         let func: &str;
@@ -121,7 +153,7 @@ impl ReentrantToken {
     }
 
     /// Returns the sentinel code recorded by the last reentrant attempt:
-    /// 1 = nested call succeeded, 4 = rejected with a contract error,
+    /// 1 = nested call succeeded, 4 = invocation rejected,
     /// 200 = aborted at host level, u32::MAX = no reentry attempted yet.
     pub fn get_nested_result(e: Env) -> u32 {
         e.storage()

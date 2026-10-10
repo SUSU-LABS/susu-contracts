@@ -1514,8 +1514,8 @@ fn setup_reentrant(mode: u32) -> ReentrantSetup {
 }
 
 /// A re-entrant token that attacks *across* the round boundary: during round
-/// N's payout transfer it re-enters `execute_payout` (which must fail — the
-/// effects have already advanced the round). Afterwards the run must be
+/// N's payout transfer it re-enters `execute_payout` (which must fail). A separate
+/// probe checks the paid marker before token transfer. Afterwards the run must be
 /// indistinguishable from a clean run performing the same logical operations.
 #[test]
 fn execute_payout_reentrant_across_rounds_no_double_pay() {
@@ -1537,6 +1537,11 @@ fn execute_payout_reentrant_across_rounds_no_double_pay() {
         a_client.contribute(&attack.members.get(j).unwrap(), &attack.amount, &1);
         j += 1;
     }
+    attack.env.invoke_contract::<()>(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "expect_round"),
+        vec![&attack.env, 1u32.into_val(&attack.env)],
+    );
     // Arm mode 3 so the re-entry fires during execute_payout.
     attack.env.invoke_contract::<()>(
         &attack.token_id,
@@ -1579,19 +1584,21 @@ fn execute_payout_reentrant_across_rounds_no_double_pay() {
         "expected exactly one PayoutExecuted event for round 1"
     );
 
-    // The nested re-entrant payout must have been cleanly rejected with a
-    // contract error (code 4), proving the round had already advanced past
-    // payout when the token re-entered. Success (1) would mean double payout;
-    // abort (200) would mean the guard failed differently.
+    let observed: bool = attack.env.invoke_contract(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "observed_paid"),
+        vec![&attack.env],
+    );
+    assert!(observed, "round 1 effects must precede the token transfer");
+
+    // Re-entry is rejected; the separate state probe above distinguishes our
+    // effects ordering from the host's independent re-entry protection.
     let nested_code: u32 = attack.env.invoke_contract(
         &attack.token_id,
         &Symbol::new(&attack.env, "get_nested_result"),
         vec![&attack.env],
     );
-    assert_eq!(
-        nested_code, 4,
-        "nested execute_payout should be rejected with a contract error"
-    );
+    assert_eq!(nested_code, 4, "nested execute_payout should be rejected");
 
     // Exactly one payout for round 1, to the scheduled recipient.
     assert_eq!(
@@ -1619,7 +1626,23 @@ fn execute_payout_reentrant_across_rounds_no_double_pay() {
     a_client.contribute(&attack.members.get(2).unwrap(), &attack.amount, &2u32);
     let r2_recipient = attack.members.get(1).unwrap();
     let r2_before = a_token.balance(&r2_recipient);
+    attack.env.invoke_contract::<()>(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "expect_round"),
+        vec![&attack.env, 2u32.into_val(&attack.env)],
+    );
+    attack.env.invoke_contract::<()>(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "set_mode"),
+        vec![&attack.env, 3u32.into_val(&attack.env)],
+    );
     a_client.execute_payout();
+    let observed: bool = attack.env.invoke_contract(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "observed_paid"),
+        vec![&attack.env],
+    );
+    assert!(observed, "round 2 effects must precede the token transfer");
     assert_eq!(
         a_token.balance(&r2_recipient),
         r2_before + recipient_amount,
