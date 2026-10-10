@@ -873,4 +873,6 @@ fn extend_persistent_ttl(env: &Env, key: &DataKey) {
         .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
 }
 
+#[cfg(test)]
+mod reentrant_token;
 mod test;
