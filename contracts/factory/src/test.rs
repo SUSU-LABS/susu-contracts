@@ -432,3 +432,63 @@ fn set_treasury_rejects_admin_or_factory_address() {
     assert!(client.try_set_treasury(&valid_treasury).is_ok());
     assert_eq!(client.get_config().treasury, valid_treasury);
 }
+
+// ---------------------------------------------------------------------------
+// Registry TTL
+// ---------------------------------------------------------------------------
+
+/// Reads the persistent TTL of a registry entry.
+fn registry_ttl(env: &Env, client: &FactoryContractClient, group_id: u32) -> u32 {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Group(group_id))
+    })
+}
+
+#[test]
+fn get_group_extends_ttl_on_read() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+
+    // Seed a registry entry directly: `create_group` needs the compiled Group
+    // Wasm, but the read path under test only touches the registry entry.
+    // Mirror the write path: `set` then extend, as `create_group` does.
+    let group_id = 1u32;
+    let group_address = Address::generate(&env);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Group(group_id), &group_address);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Group(group_id),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    });
+    let written_at = env.ledger().sequence();
+
+    // Advance until the remaining TTL drops below the threshold: only then
+    // does `extend_ttl` fire (it is a no-op while the entry is comfortably
+    // alive).
+    env.ledger()
+        .set_sequence_number(written_at + PERSISTENT_TTL_EXTEND_TO - PERSISTENT_TTL_THRESHOLD + 1);
+    assert!(
+        registry_ttl(&env, &client, group_id) < PERSISTENT_TTL_THRESHOLD,
+        "test setup: entry should be near expiry"
+    );
+
+    // The read extends the entry's TTL.
+    assert_eq!(client.get_group(&group_id), group_address);
+    assert_eq!(
+        registry_ttl(&env, &client, group_id),
+        PERSISTENT_TTL_EXTEND_TO,
+        "get_group did not extend the registry entry's TTL"
+    );
+
+    // Advance past the original write-time expiry: without the extension
+    // above, the entry would be archived and this would be `GroupNotFound`.
+    env.ledger()
+        .set_sequence_number(written_at + PERSISTENT_TTL_EXTEND_TO + 1);
+    assert_eq!(client.get_group(&group_id), group_address);
+}
