@@ -166,7 +166,8 @@ pub struct RoundInfo {
     pub contribution_count: u32,
     pub phase: RoundPhase,
     pub payout_executed: bool,
-    /// The scheduled recipient. `None` for a round that does not exist yet.
+    /// The scheduled recipient. `None` for a round that has not started yet
+    /// (a future round) or does not exist.
     pub recipient: Option<Address>,
 }
 
@@ -254,6 +255,8 @@ pub enum GroupError {
     SplitInvariantViolated = 19,
     /// Treasury address cannot be the group contract address.
     InvalidTreasury = 20,
+    /// Token address cannot be the group contract address.
+    InvalidToken = 21,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +320,27 @@ pub struct GroupCompleted {
     pub rounds: u32,
 }
 
+/// The group was constructed with its full immutable configuration.
+///
+/// The Factory's `group_created` event records a group's existence, but the group
+/// itself previously published nothing at construction, so its own configuration
+/// had no on-chain record an indexer could reconcile against — and a group deployed
+/// by any other route had none at all. This pins the exact values the group started
+/// from, so its full history is reconstructable from the group's own events. The
+/// fields mirror `GroupConfig`, which is captured once and never modified.
+#[contractevent(topics = ["susu", "group_initialized"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupInitialized {
+    pub factory: Address,
+    pub creator: Address,
+    pub token: Address,
+    pub treasury: Address,
+    pub contribution_amount: i128,
+    pub member_capacity: u32,
+    pub frequency_seconds: u64,
+    pub fee_bps: u32,
+}
+
 /// The Susu Group contract type.
 #[contract]
 pub struct GroupContract;
@@ -361,6 +385,9 @@ impl GroupContract {
         if treasury == env.current_contract_address() {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidTreasury);
         }
+        if token == env.current_contract_address() {
+            soroban_sdk::panic_with_error!(&env, GroupError::InvalidToken);
+        }
         // The fee ceiling is enforced here *and* in the Factory, so a group can
         // never charge more than the protocol maximum even if it were deployed
         // by some other means.
@@ -386,6 +413,18 @@ impl GroupContract {
         storage.set(&DataKey::RoundPhase, &RoundPhase::WaitingForContributions);
         storage.set(&DataKey::MemberCount, &0u32);
         extend_instance_ttl(&env);
+
+        GroupInitialized {
+            factory: config.factory.clone(),
+            creator: config.creator.clone(),
+            token: config.token.clone(),
+            treasury: config.treasury.clone(),
+            contribution_amount: config.contribution_amount,
+            member_capacity: config.member_capacity,
+            frequency_seconds: config.frequency_seconds,
+            fee_bps: config.fee_bps,
+        }
+        .publish(&env);
     }
 
     /// Join the group, taking the next position in the payout order.
@@ -666,6 +705,7 @@ impl GroupContract {
 
     /// Full observable state of the group.
     pub fn get_group(env: Env) -> GroupState {
+        extend_instance_ttl(&env);
         let storage = env.storage().instance();
         GroupState {
             config: storage.get(&DataKey::Config).unwrap(),
@@ -680,14 +720,19 @@ impl GroupContract {
 
     /// A member's 1-based position in the payout order, or `0` if not a member.
     pub fn get_member(env: Env, address: Address) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Member(address))
-            .unwrap_or(0)
+        let key = DataKey::Member(address);
+        match env.storage().persistent().get(&key) {
+            Some(position) => {
+                extend_persistent_ttl(&env, &key);
+                position
+            }
+            None => 0,
+        }
     }
 
     /// The number of members that have joined.
     pub fn get_member_count(env: Env) -> u32 {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::MemberCount)
@@ -720,25 +765,33 @@ impl GroupContract {
         let payout_executed: bool = persistent
             .get(&DataKey::PayoutExecuted(round))
             .unwrap_or(false);
-        let recipient: Option<Address> = persistent.get(&DataKey::MemberAt(round));
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        // The payout order is fixed at join time, but a round that has not
+        // started yet has no observable recipient: `recipient` is `None` for
+        // future rounds, as documented on `RoundInfo`. A round whose payout
+        // already executed keeps its recipient so completed rounds stay
+        // auditable.
+        let recipient: Option<Address> = if !payout_executed && round > current_round {
+            None
+        } else {
+            persistent.get(&DataKey::MemberAt(round))
+        };
 
         // A round that has not started yet reports its phase as waiting.
         let phase = if payout_executed {
             RoundPhase::PayoutExecuted
-        } else {
-            let current_round: u32 = env
-                .storage()
+        } else if round == current_round {
+            env.storage()
                 .instance()
-                .get(&DataKey::CurrentRound)
-                .unwrap_or(0);
-            if round == current_round {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::RoundPhase)
-                    .unwrap_or(RoundPhase::WaitingForContributions)
-            } else {
-                RoundPhase::WaitingForContributions
-            }
+                .get(&DataKey::RoundPhase)
+                .unwrap_or(RoundPhase::WaitingForContributions)
+        } else {
+            RoundPhase::WaitingForContributions
         };
 
         RoundInfo {

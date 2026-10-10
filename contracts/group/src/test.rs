@@ -159,6 +159,62 @@ fn constructor_stores_configuration_and_opens_the_group() {
 }
 
 #[test]
+fn constructor_publishes_the_initial_configuration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let treasury = Address::generate(&env);
+    let amount = 10 * ONE_USDC;
+    let capacity = 3u32;
+    let fee_bps = MAX_FEE_BPS;
+
+    let group_id = env.register(
+        GroupContract,
+        (
+            factory.clone(),
+            creator.clone(),
+            token.clone(),
+            treasury.clone(),
+            amount,
+            capacity,
+            ONE_WEEK,
+            fee_bps,
+        ),
+    );
+
+    // The constructor is the only invocation so far, so `events().all()` is exactly
+    // what it published. Assert exactly one event, carrying the full configuration,
+    // so a duplicated emission would also fail.
+    let emitted = env.events().all().filter_by_contract(&group_id);
+    let expected = GroupInitialized {
+        factory,
+        creator,
+        token,
+        treasury,
+        contribution_amount: amount,
+        member_capacity: capacity,
+        frequency_seconds: ONE_WEEK,
+        fee_bps,
+    }
+    .to_xdr(&env, &group_id);
+
+    assert_eq!(
+        emitted
+            .events()
+            .iter()
+            .filter(|event| **event == expected)
+            .count(),
+        1,
+        "the constructor must publish exactly one GroupInitialized event"
+    );
+}
+
+#[test]
 #[should_panic]
 fn constructor_rejects_non_positive_contribution_amount() {
     let env = Env::default();
@@ -970,6 +1026,228 @@ fn fee_split_truncates_toward_the_recipient() {
     assert_eq!(recipient_amount, 1);
 }
 
+/// PRNG for deterministic property and fuzz testing without external dependencies.
+struct FuzzRng(u64);
+
+impl FuzzRng {
+    const fn new(seed: u64) -> Self {
+        Self(if seed == 0 { 0xdeadbeefcafebabe } else { seed })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn next_u128(&mut self) -> u128 {
+        ((self.next_u64() as u128) << 64) | (self.next_u64() as u128)
+    }
+}
+
+/// Property test iterating pools (including i128 extremes and fuzz distributions)
+/// and all valid fee_bps values, asserting:
+/// 1. `fee + recipient_amount == pool` holds exactly for every pair.
+/// 2. `fee` is always the integer floor of the exact ratio `pool * fee_bps / 10_000`.
+/// 3. The fee never exceeds `pool * fee_bps / 10_000`.
+/// 4. Remainder is non-negative and strictly less than `BPS_DENOMINATOR`.
+#[test]
+fn fee_split_property_fuzz_across_pools_and_all_valid_fee_bps() {
+    let mut rng = FuzzRng::new(0x1337c0de5eed);
+
+    for fee_bps in 1..=MAX_FEE_BPS {
+        let bps = fee_bps as i128;
+        let max_safe_pool = i128::MAX / bps;
+
+        // Structured representative pools covering zero, small amounts, currency units,
+        // intermediate values, and upper bounds up to max_safe_pool.
+        let fixed_pools: [i128; 39] = [
+            0,
+            1,
+            2,
+            3,
+            5,
+            7,
+            9,
+            10,
+            11,
+            42,
+            99,
+            100,
+            101,
+            9_999,
+            10_000,
+            10_001,
+            19_999,
+            20_000,
+            20_001,
+            99_999,
+            100_000,
+            100_001,
+            ONE_USDC,
+            10 * ONE_USDC,
+            30 * ONE_USDC,
+            100 * ONE_USDC,
+            100_000_000,
+            1_000_000_000,
+            123_456_789_012_345,
+            1_000_000_000_000_000_000,
+            max_safe_pool / 4,
+            max_safe_pool / 3,
+            max_safe_pool / 2,
+            (max_safe_pool / 3) * 2,
+            (max_safe_pool / 4) * 3,
+            (max_safe_pool / 10) * 9,
+            max_safe_pool - 10_000,
+            max_safe_pool - 1,
+            max_safe_pool,
+        ];
+
+        let test_pool = |pool: i128| {
+            let (fee, recipient_amount) = split_pool(pool, fee_bps)
+                .unwrap_or_else(|e| panic!("split_pool({pool}, {fee_bps}) failed: {e:?}"));
+
+            // Invariant: fee + recipient_amount == pool
+            assert_eq!(
+                fee + recipient_amount,
+                pool,
+                "fee + recipient_amount must equal pool (pool={pool}, fee_bps={fee_bps})"
+            );
+
+            assert!(
+                fee >= 0,
+                "fee must not be negative (pool={pool}, fee_bps={fee_bps})"
+            );
+            assert!(
+                recipient_amount <= pool,
+                "recipient_amount must not exceed pool (pool={pool}, fee_bps={fee_bps})"
+            );
+            assert!(
+                recipient_amount >= 0,
+                "recipient_amount must not be negative (pool={pool}, fee_bps={fee_bps})"
+            );
+
+            let numerator = pool * bps;
+            let expected_fee = numerator / BPS_DENOMINATOR;
+
+            // Invariant: fee is always the floor of the exact ratio pool * fee_bps / 10_000
+            assert_eq!(
+                fee, expected_fee,
+                "fee must match floor of exact ratio (pool={pool}, fee_bps={fee_bps})"
+            );
+
+            // Fee never exceeds pool * fee_bps / 10_000
+            assert!(
+                fee * BPS_DENOMINATOR <= numerator,
+                "fee must never exceed pool * fee_bps / 10_000 (pool={pool}, fee_bps={fee_bps})"
+            );
+
+            // Remainder in [0, 10_000), proving exact floor truncation
+            let remainder = numerator - fee * BPS_DENOMINATOR;
+            assert!(
+                (0..BPS_DENOMINATOR).contains(&remainder),
+                "remainder {remainder} must be in [0, 10_000) (pool={pool}, fee_bps={fee_bps})"
+            );
+        };
+
+        for &pool in &fixed_pools {
+            test_pool(pool);
+        }
+
+        // Powers of 2 and offsets up to max_safe_pool
+        for shift in 1..127 {
+            if let Some(p) = 1i128.checked_shl(shift) {
+                if p <= max_safe_pool {
+                    test_pool(p);
+                    test_pool(p - 1);
+                    if p < max_safe_pool {
+                        test_pool(p + 1);
+                    }
+                }
+            }
+        }
+
+        // Powers of 10 and offsets up to max_safe_pool
+        let mut pow10: i128 = 1;
+        while let Some(next) = pow10.checked_mul(10) {
+            if next > max_safe_pool {
+                break;
+            }
+            pow10 = next;
+            test_pool(pow10);
+            test_pool(pow10 - 1);
+            if pow10 < max_safe_pool {
+                test_pool(pow10 + 1);
+            }
+        }
+
+        // Property fuzzing: 200 pseudo-random pools distributed up to max_safe_pool
+        for _ in 0..200 {
+            let rand_val = (rng.next_u128() % (max_safe_pool as u128 + 1)) as i128;
+            test_pool(rand_val);
+        }
+    }
+}
+
+/// Boundary pools near and above overflow threshold fail with ArithmeticOverflow, not a panic.
+#[test]
+fn boundary_pools_near_overflow_fail_with_arithmetic_overflow() {
+    for fee_bps in 1..=MAX_FEE_BPS {
+        let bps = fee_bps as i128;
+        let max_safe_pool = i128::MAX / bps;
+
+        // Boundary: highest non-overflowing pool succeeds
+        let (fee, recipient) = split_pool(max_safe_pool, fee_bps)
+            .expect("max_safe_pool must succeed without overflow");
+        assert_eq!(fee + recipient, max_safe_pool);
+        assert_eq!(fee, (max_safe_pool * bps) / BPS_DENOMINATOR);
+
+        // When fee_bps > 1, max_safe_pool < i128::MAX; any pool above it overflows checked_mul
+        if fee_bps > 1 {
+            let overflow_boundary_pools = [
+                max_safe_pool + 1,
+                max_safe_pool + 2,
+                max_safe_pool + 10_000,
+                i128::MAX - 1,
+                i128::MAX,
+            ];
+
+            for &overflow_pool in &overflow_boundary_pools {
+                assert_eq!(
+                    split_pool(overflow_pool, fee_bps),
+                    Err(GroupError::ArithmeticOverflow),
+                    "pool {overflow_pool} with fee_bps {fee_bps} must return ArithmeticOverflow, not panic"
+                );
+            }
+        } else {
+            // At 1 bps, max_safe_pool is i128::MAX
+            assert_eq!(max_safe_pool, i128::MAX);
+        }
+
+        // Negative boundary checks near i128::MIN
+        let min_safe_pool = i128::MIN / bps;
+        if fee_bps > 1 {
+            let min_overflow_pools = [
+                min_safe_pool - 1,
+                min_safe_pool - 2,
+                min_safe_pool - 10_000,
+                i128::MIN,
+            ];
+
+            for &min_overflow in &min_overflow_pools {
+                assert_eq!(
+                    split_pool(min_overflow, fee_bps),
+                    Err(GroupError::ArithmeticOverflow),
+                    "negative pool {min_overflow} with fee_bps {fee_bps} must return ArithmeticOverflow"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Storage, TTL and views
 // ---------------------------------------------------------------------------
@@ -991,6 +1269,51 @@ fn ttl_is_extended_by_an_interaction() {
 }
 
 #[test]
+fn read_view_extends_group_instance_ttl() {
+    use soroban_sdk::testutils::{Deployer as _, Ledger as _};
+    let setup = setup(2, 10 * ONE_USDC, MAX_FEE_BPS);
+
+    // Advance ledger past threshold
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(INSTANCE_TTL_THRESHOLD + 10);
+
+    // get_group read extends instance TTL
+    let state = setup.client().get_group();
+    assert_eq!(state.status, Status::Open);
+
+    let ttl = setup
+        .env
+        .deployer()
+        .get_contract_instance_ttl(&setup.group_id);
+    assert!(
+        ttl > INSTANCE_TTL_THRESHOLD,
+        "get_group read must extend instance TTL (ttl={ttl})"
+    );
+
+    // get_member_count also extends instance TTL
+    assert_eq!(setup.client().get_member_count(), 0);
+}
+
+#[test]
+fn persistent_entries_survive_past_threshold_via_read_path() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Advance sequence number past PERSISTENT_TTL_THRESHOLD
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(PERSISTENT_TTL_THRESHOLD + 10);
+
+    // Reading member extends persistent Member key and returns valid position
+    let pos = client.get_member(&setup.member(0));
+    assert_eq!(pos, 1);
+}
+
+#[test]
 fn get_round_reports_an_unstarted_round_safely() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
     let round = setup.client().get_round(&5u32);
@@ -1000,6 +1323,50 @@ fn get_round_reports_an_unstarted_round_safely() {
     assert_eq!(round.contribution_count, 0);
     assert!(!round.payout_executed);
     assert_eq!(round.recipient, None);
+}
+
+#[test]
+fn get_round_returns_no_recipient_for_future_rounds() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Round 1 is the current round: its scheduled recipient is observable.
+    assert_eq!(client.get_round(&1u32).recipient, Some(setup.member(0)));
+
+    // Rounds 2 and 3 have not started yet: no observable recipient, even
+    // though the payout order is already fixed at join time.
+    let round2 = client.get_round(&2u32);
+    assert_eq!(round2.recipient, None);
+    assert_eq!(round2.phase, RoundPhase::WaitingForContributions);
+    assert!(!round2.payout_executed);
+
+    let round3 = client.get_round(&3u32);
+    assert_eq!(round3.recipient, None);
+    assert_eq!(round3.phase, RoundPhase::WaitingForContributions);
+    assert!(!round3.payout_executed);
+}
+
+#[test]
+fn get_round_keeps_recipient_for_completed_and_current_rounds() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Complete round 1.
+    setup.contribute_all(1);
+    client.execute_payout();
+
+    // The completed round keeps its recipient for auditability.
+    let round1 = client.get_round(&1u32);
+    assert!(round1.payout_executed);
+    assert_eq!(round1.recipient, Some(setup.member(0)));
+
+    // Round 2 is now current: its recipient is observable.
+    let round2 = client.get_round(&2u32);
+    assert!(!round2.payout_executed);
+    assert_eq!(round2.recipient, Some(setup.member(1)));
+
+    // Round 3 is still in the future: no recipient.
+    assert_eq!(client.get_round(&3u32).recipient, None);
 }
 
 #[test]
@@ -1061,6 +1428,33 @@ fn constructor_rejects_treasury_equal_to_group() {
             creator,
             token,
             group_id.clone(),
+            10_000_000i128,
+            3u32,
+            604_800u64,
+            50u32,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
+fn constructor_rejects_token_equal_to_group() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let group_id = Address::generate(&env);
+    let factory = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // Registering with token = group_id should panic
+    env.register_at(
+        &group_id,
+        GroupContract,
+        (
+            factory,
+            creator,
+            group_id.clone(),
+            treasury,
             10_000_000i128,
             3u32,
             604_800u64,
