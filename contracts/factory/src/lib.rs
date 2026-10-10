@@ -143,6 +143,21 @@ pub struct PauseUpdated {
     pub paused: bool,
 }
 
+/// The Factory was constructed with its initial configuration.
+///
+/// Later changes emit `FeeUpdated`/`TreasuryUpdated`/`PauseUpdated`; without
+/// this event the initial admin, treasury, fee and Wasm hash would only exist
+/// in deployment calldata. Publishing it here keeps the full configuration
+/// history observable from chain events.
+#[contractevent(topics = ["susu", "factory_initialized"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactoryInitialized {
+    pub admin: Address,
+    pub treasury: Address,
+    pub fee_bps: u32,
+    pub group_wasm_hash: BytesN<32>,
+}
+
 /// The Susu Factory contract type.
 #[contract]
 pub struct FactoryContract;
@@ -178,6 +193,15 @@ impl FactoryContract {
         };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::GroupCount, &0u32);
+        // The initial configuration is part of chain history from deployment,
+        // just like every later change.
+        FactoryInitialized {
+            admin: config.admin.clone(),
+            treasury: config.treasury.clone(),
+            fee_bps: config.fee_bps,
+            group_wasm_hash: config.group_wasm_hash.clone(),
+        }
+        .publish(&env);
     }
 
     /// Deploy and register a new group.
