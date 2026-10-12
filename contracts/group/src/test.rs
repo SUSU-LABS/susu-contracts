@@ -12,7 +12,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{storage::Persistent, Address as _, Events as _, Ledger as _},
     token, Event, Vec,
 };
 
@@ -1306,7 +1306,7 @@ fn persistent_entries_survive_past_threshold_via_read_path() {
     setup
         .env
         .ledger()
-        .set_sequence_number(PERSISTENT_TTL_THRESHOLD + 10);
+        .set_sequence_number(420_000);
 
     // Reading member extends persistent Member key and returns valid position
     let pos = client.get_member(&setup.member(0));
@@ -1436,4 +1436,216 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         client.try_contribute(&setup.member(0), &setup.amount, &1u32),
         Err(Ok(GroupError::ArithmeticOverflow))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Read paths extend TTL for the persistent entries they touch (issue #33)
+//
+// The group module's docs claim persistent entries survive idle periods via
+// read-side TTL extension; issue #33 calls out that get_payout_order,
+// get_round, get_current_recipient and get_pool_balance previously did not
+// extend the keys they read. Each test below advances the ledger past the
+// threshold, calls a read, and asserts the entry's TTL grew.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_payout_order_extends_the_member_at_ttl_for_each_position() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Advance the ledger so the entries are about to archive.
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(420_000);
+
+    let before = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MemberAt(1))
+        });
+    assert!(
+        before <= PERSISTENT_TTL_THRESHOLD,
+        "before read, the entry must be near the threshold (was {before})"
+    );
+
+    // Trigger the read path. Both MemberAt(1) and MemberAt(2) must be extended.
+    let _ = client.get_payout_order();
+
+    let after_1 = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MemberAt(1))
+        });
+    let after_2 = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MemberAt(2))
+        });
+    assert!(
+        after_1 > before,
+        "get_payout_order must extend MemberAt(1) TTL (before={before}, after={after_1})"
+    );
+    assert!(
+        after_2 > before,
+        "get_payout_order must extend MemberAt(2) TTL (before={before}, after={after_2})"
+    );
+    assert_eq!(after_1, PERSISTENT_TTL_EXTEND_TO);
+    assert_eq!(after_2, PERSISTENT_TTL_EXTEND_TO);
+}
+
+#[test]
+fn get_round_extends_persistent_entries_for_a_started_round() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    setup.contribute_all(1);
+    client.execute_payout();
+
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(420_000);
+
+    let before_member = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MemberAt(1))
+        });
+    let before_pool = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::RoundPool(1))
+        });
+
+    let _ = client.get_round(&1u32);
+
+    let after_member = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MemberAt(1))
+        });
+    let after_pool = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::RoundPool(1))
+        });
+    assert!(
+        after_member > before_member,
+        "get_round must extend MemberAt(1) TTL"
+    );
+    assert!(
+        after_pool > before_pool,
+        "get_round must extend RoundPool(1) TTL"
+    );
+    assert_eq!(after_member, PERSISTENT_TTL_EXTEND_TO);
+    assert_eq!(after_pool, PERSISTENT_TTL_EXTEND_TO);
+}
+
+#[test]
+fn get_current_recipient_extends_the_member_at_ttl() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(420_000);
+
+    let before = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MemberAt(1))
+        });
+
+    let _ = client.get_current_recipient();
+
+    let after = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MemberAt(1))
+        });
+    assert!(
+        after > before,
+        "get_current_recipient must extend MemberAt(1) TTL (before={before}, after={after})"
+    );
+    assert_eq!(after, PERSISTENT_TTL_EXTEND_TO);
+}
+
+#[test]
+fn get_pool_balance_extends_the_round_pool_ttl() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    setup.contribute_all(1);
+
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(420_000);
+
+    let before = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::RoundPool(1))
+        });
+
+    let _ = client.get_pool_balance();
+
+    let after = setup
+        .env
+        .as_contract(&setup.group_id, || {
+            setup
+                .env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::RoundPool(1))
+        });
+    assert!(
+        after > before,
+        "get_pool_balance must extend RoundPool(1) TTL (before={before}, after={after})"
+    );
+    assert_eq!(after, PERSISTENT_TTL_EXTEND_TO);
 }

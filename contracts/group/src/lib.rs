@@ -741,6 +741,7 @@ impl GroupContract {
     /// The immutable payout order, in join order. Position `n` (1-based) is paid in
     /// round `n`.
     pub fn get_payout_order(env: Env) -> Vec<Address> {
+        extend_instance_ttl(&env);
         let count: u32 = env
             .storage()
             .instance()
@@ -750,7 +751,9 @@ impl GroupContract {
         let mut order = Vec::new(&env);
         let mut position = 1u32;
         while position <= count {
-            if let Some(address) = persistent.get(&DataKey::MemberAt(position)) {
+            let key = DataKey::MemberAt(position);
+            if let Some(address) = persistent.get(&key) {
+                extend_persistent_ttl(&env, &key);
                 order.push_back(address);
             }
             position += 1;
@@ -761,20 +764,37 @@ impl GroupContract {
     /// Observable state of a specific round.
     pub fn get_round(env: Env, round: u32) -> RoundInfo {
         let persistent = env.storage().persistent();
-        let payout_executed: bool = persistent
-            .get(&DataKey::PayoutExecuted(round))
-            .unwrap_or(false);
-        let recipient: Option<Address> = persistent.get(&DataKey::MemberAt(round));
+
+        // Every persistent key this read touches must have its TTL extended, or
+        // an idle group archives them and a later `execute_payout` fails with
+        // `WrongRound` because `MemberAt(round)` is gone. The instance entry
+        // also has to be extended so the read keeps the group alive.
+        let payout_executed_key = DataKey::PayoutExecuted(round);
+        let member_at_key = DataKey::MemberAt(round);
+        let pool_key = DataKey::RoundPool(round);
+        let count_key = DataKey::RoundContributionCount(round);
+
+        let payout_executed: bool = persistent.get(&payout_executed_key).unwrap_or(false);
+        if persistent.has(&payout_executed_key) {
+            extend_persistent_ttl(&env, &payout_executed_key);
+        }
+
+        extend_instance_ttl(&env);
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        let recipient: Option<Address> = persistent.get(&member_at_key);
+        if persistent.has(&member_at_key) {
+            extend_persistent_ttl(&env, &member_at_key);
+        }
 
         // A round that has not started yet reports its phase as waiting.
         let phase = if payout_executed {
             RoundPhase::PayoutExecuted
         } else {
-            let current_round: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::CurrentRound)
-                .unwrap_or(0);
             if round == current_round {
                 env.storage()
                     .instance()
@@ -785,12 +805,19 @@ impl GroupContract {
             }
         };
 
+        let pool: i128 = persistent.get(&pool_key).unwrap_or(0i128);
+        if persistent.has(&pool_key) {
+            extend_persistent_ttl(&env, &pool_key);
+        }
+        let contribution_count: u32 = persistent.get(&count_key).unwrap_or(0);
+        if persistent.has(&count_key) {
+            extend_persistent_ttl(&env, &count_key);
+        }
+
         RoundInfo {
             round,
-            pool: persistent.get(&DataKey::RoundPool(round)).unwrap_or(0i128),
-            contribution_count: persistent
-                .get(&DataKey::RoundContributionCount(round))
-                .unwrap_or(0),
+            pool,
+            contribution_count,
             phase,
             payout_executed,
             recipient,
@@ -799,6 +826,7 @@ impl GroupContract {
 
     /// The member scheduled to receive the current round's payout.
     pub fn get_current_recipient(env: Env) -> Result<Address, GroupError> {
+        extend_instance_ttl(&env);
         let round: u32 = env
             .storage()
             .instance()
@@ -807,8 +835,12 @@ impl GroupContract {
         if round == 0 {
             return Err(GroupError::NotActive);
         }
-        match env.storage().persistent().get(&DataKey::MemberAt(round)) {
-            Some(address) => Ok(address),
+        let key = DataKey::MemberAt(round);
+        match env.storage().persistent().get(&key) {
+            Some(address) => {
+                extend_persistent_ttl(&env, &key);
+                Ok(address)
+            }
             None => Err(GroupError::WrongRound),
         }
     }
@@ -828,6 +860,7 @@ impl GroupContract {
     /// payout. In normal operation the two are equal, because every round pays out
     /// in full.
     pub fn get_pool_balance(env: Env) -> i128 {
+        extend_instance_ttl(&env);
         let round: u32 = env
             .storage()
             .instance()
@@ -836,10 +869,12 @@ impl GroupContract {
         if round == 0 {
             return 0;
         }
-        env.storage()
-            .persistent()
-            .get(&DataKey::RoundPool(round))
-            .unwrap_or(0i128)
+        let key = DataKey::RoundPool(round);
+        let value: i128 = env.storage().persistent().get(&key).unwrap_or(0i128);
+        if env.storage().persistent().has(&key) {
+            extend_persistent_ttl(&env, &key);
+        }
+        value
     }
 
     /// Whether every member has contributed to the current round.
