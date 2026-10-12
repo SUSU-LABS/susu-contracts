@@ -1437,3 +1437,92 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         Err(Ok(GroupError::ArithmeticOverflow))
     );
 }
+
+// ---------------------------------------------------------------------------
+// get_round recipient visibility (issue #39)
+//
+// `RoundInfo.recipient` is documented as "None for a round that does not exist
+// yet". `get_round` previously always read `DataKey::MemberAt(round)`, which is
+// populated at `join_member` time, so a future round reported its scheduled
+// recipient while its phase was still `WaitingForContributions`. The doc /
+// observable behaviour mismatch is what issue #39 calls out: a future round
+// must report `None`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_round_returns_no_recipient_for_a_future_round() {
+    // setup_started joins all 3 members and calls start(), so current_round = 1.
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Round 1 is the current round: it must report its scheduled recipient.
+    let r1 = client.get_round(&1u32);
+    assert_eq!(r1.phase, RoundPhase::WaitingForContributions);
+    assert!(
+        r1.recipient.is_some(),
+        "the current round must still surface its scheduled recipient"
+    );
+
+    // Round 2 is in the future: it must report no recipient.
+    let r2 = client.get_round(&2u32);
+    assert_eq!(r2.phase, RoundPhase::WaitingForContributions);
+    assert!(
+        r2.recipient.is_none(),
+        "a future round must not surface a recipient it has not reached yet"
+    );
+
+    // Round 3 is also in the future: no recipient either.
+    let r3 = client.get_round(&3u32);
+    assert_eq!(r3.phase, RoundPhase::WaitingForContributions);
+    assert!(r3.recipient.is_none());
+}
+
+#[test]
+fn get_round_still_reports_recipient_for_paid_out_and_current_rounds() {
+    // After round 1's payout, round 2 becomes current (recipient Some) and
+    // round 3 stays future (recipient None). The paid-out round 1 keeps its
+    // historical recipient.
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    setup.contribute_all(1);
+    client.execute_payout();
+
+    // Round 1: paid out, recipient preserved.
+    let r1 = client.get_round(&1u32);
+    assert!(r1.payout_executed, "round 1 was just paid out");
+    assert_eq!(r1.phase, RoundPhase::PayoutExecuted);
+    assert!(
+        r1.recipient.is_some(),
+        "a paid-out round must keep its recipient visible for history"
+    );
+
+    // Round 2: now the current round, with its scheduled recipient.
+    let r2 = client.get_round(&2u32);
+    assert!(!r2.payout_executed);
+    assert_eq!(r2.phase, RoundPhase::WaitingForContributions);
+    assert!(r2.recipient.is_some());
+
+    // Round 3: still future, no recipient.
+    let r3 = client.get_round(&3u32);
+    assert!(!r3.payout_executed);
+    assert_eq!(r3.phase, RoundPhase::WaitingForContributions);
+    assert!(r3.recipient.is_none());
+}
+
+#[test]
+fn get_round_returns_no_recipient_for_any_round_before_start() {
+    // Before start() the current_round is 0, so every round (1..capacity) is
+    // strictly future and must report recipient: None.
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    for round in 1u32..=setup.capacity {
+        let info = client.get_round(&round);
+        assert_eq!(info.phase, RoundPhase::WaitingForContributions);
+        assert!(
+            info.recipient.is_none(),
+            "round {round} is future before start; recipient must be None"
+        );
+    }
+}
