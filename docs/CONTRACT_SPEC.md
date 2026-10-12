@@ -283,6 +283,7 @@ to filter by them.
 
 | Event | Topics | Data |
 |---|---|---|
+| `FactoryInitialized` | `susu`, `initialized` | `admin`, `treasury`, `fee_bps`, `group_wasm_hash` |
 | `GroupCreated` | `susu`, `group_created`, `creator`, `group` | `group_id`, `token`, `contribution_amount`, `member_capacity`, `fee_bps`, `treasury`, `frequency_seconds` |
 | `FeeUpdated` | `susu`, `fee_updated` | `fee_bps` |
 | `TreasuryUpdated` | `susu`, `treasury_updated`, `treasury` | — |
