@@ -74,8 +74,31 @@ fn set_fee_updates_future_groups_within_the_cap() {
     let emitted = env.events().all().filter_by_contract(&client.address);
 
     assert_eq!(client.get_config().fee_bps, 10);
-    let expected = FeeUpdated { fee_bps: 10 }.to_xdr(&env, &client.address);
+    let expected = FeeUpdated {
+        previous_fee_bps: MAX_FEE_BPS,
+        fee_bps: 10,
+    }
+    .to_xdr(&env, &client.address);
     assert!(emitted.events().contains(&expected));
+}
+
+#[test]
+fn set_fee_emits_previous_fee_bps_as_the_prior_stored_value() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+
+    client.set_fee(&10u32);
+    client.set_fee(&25u32);
+    let emitted = env.events().all().filter_by_contract(&client.address);
+
+    let expected = FeeUpdated {
+        previous_fee_bps: 10,
+        fee_bps: 25,
+    }
+    .to_xdr(&env, &client.address);
+    assert!(
+        emitted.events().contains(&expected),
+        "the second set_fee must report the previously-stored fee as previous_fee_bps"
+    );
 }
 
 #[test]
@@ -120,7 +143,7 @@ fn set_fee_requires_admin_authorization() {
 
 #[test]
 fn set_treasury_updates_future_groups() {
-    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let (env, _, initial_treasury, client) = setup(MAX_FEE_BPS);
     let new_treasury = Address::generate(&env);
 
     client.set_treasury(&new_treasury);
@@ -129,9 +152,31 @@ fn set_treasury_updates_future_groups() {
     assert_eq!(client.get_config().treasury, new_treasury);
     let expected = TreasuryUpdated {
         treasury: new_treasury,
+        previous_treasury: initial_treasury,
     }
     .to_xdr(&env, &client.address);
     assert!(emitted.events().contains(&expected));
+}
+
+#[test]
+fn set_treasury_emits_previous_treasury_as_the_prior_stored_value() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let first_treasury = Address::generate(&env);
+    let second_treasury = Address::generate(&env);
+
+    client.set_treasury(&first_treasury);
+    client.set_treasury(&second_treasury);
+    let emitted = env.events().all().filter_by_contract(&client.address);
+
+    let expected = TreasuryUpdated {
+        treasury: second_treasury.clone(),
+        previous_treasury: first_treasury,
+    }
+    .to_xdr(&env, &client.address);
+    assert!(
+        emitted.events().contains(&expected),
+        "the second set_treasury must report the previously-stored treasury as previous_treasury"
+    );
 }
 
 #[test]
