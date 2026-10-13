@@ -1313,6 +1313,90 @@ fn persistent_entries_survive_past_threshold_via_read_path() {
     assert_eq!(pos, 1);
 }
 
+fn member_at_ttl(env: &Env, group_id: &Address, position: u32) -> u32 {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    env.as_contract(group_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::MemberAt(position))
+    })
+}
+
+fn round_pool_ttl(env: &Env, group_id: &Address, round: u32) -> u32 {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    env.as_contract(group_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::RoundPool(round))
+    })
+}
+
+#[test]
+fn read_views_extend_persistent_ttl_past_threshold() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    setup.contribute_all(1);
+    let written_at = setup.env.ledger().sequence();
+
+    // Advance ledger until TTL drops below threshold
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(written_at + PERSISTENT_TTL_EXTEND_TO - PERSISTENT_TTL_THRESHOLD + 1);
+
+    assert!(
+        member_at_ttl(&setup.env, &setup.group_id, 1) < PERSISTENT_TTL_THRESHOLD,
+        "entry should be below threshold"
+    );
+
+    // Reading payout order extends all MemberAt entries
+    let order = client.get_payout_order();
+    assert_eq!(order.len(), 2);
+    assert_eq!(
+        member_at_ttl(&setup.env, &setup.group_id, 1),
+        PERSISTENT_TTL_EXTEND_TO,
+        "get_payout_order did not extend MemberAt TTL"
+    );
+    assert_eq!(
+        member_at_ttl(&setup.env, &setup.group_id, 2),
+        PERSISTENT_TTL_EXTEND_TO,
+        "get_payout_order did not extend MemberAt TTL for position 2"
+    );
+
+    // get_round extends round-related persistent keys
+    let round_info = client.get_round(&1u32);
+    assert_eq!(round_info.round, 1);
+    assert_eq!(
+        round_pool_ttl(&setup.env, &setup.group_id, 1),
+        PERSISTENT_TTL_EXTEND_TO,
+        "get_round did not extend RoundPool TTL"
+    );
+
+    // get_current_recipient extends MemberAt for current round
+    assert_eq!(client.get_current_recipient(), setup.member(0));
+    assert_eq!(
+        member_at_ttl(&setup.env, &setup.group_id, 1),
+        PERSISTENT_TTL_EXTEND_TO,
+        "get_current_recipient did not extend MemberAt TTL"
+    );
+
+    // get_pool_balance extends RoundPool TTL
+    assert_eq!(client.get_pool_balance(), 20 * ONE_USDC);
+    assert_eq!(
+        round_pool_ttl(&setup.env, &setup.group_id, 1),
+        PERSISTENT_TTL_EXTEND_TO,
+        "get_pool_balance did not extend RoundPool TTL"
+    );
+
+    // Idle past the original write-time expiry: execute_payout still succeeds because entries survived!
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(written_at + PERSISTENT_TTL_EXTEND_TO + 1);
+    assert!(client.try_execute_payout().is_ok());
+}
+
 #[test]
 fn get_round_reports_an_unstarted_round_safely() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
