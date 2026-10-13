@@ -90,7 +90,7 @@ impl ReentrantToken {
                 &Symbol::new(e, "contribute"),
                 (from, amount).into(),
             );
-        } else if mode == 2 {
+        } else if mode == 2 || mode == 3 {
             let _ = e.try_invoke_contract::<(), soroban_sdk::Error>(
                 &group,
                 &Symbol::new(e, "execute_payout"),

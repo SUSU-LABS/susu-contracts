@@ -13,7 +13,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
-    token, Event, Vec,
+    token, vec, Event, IntoVal, Map, Symbol, Val, Vec,
 };
 
 /// 1 USDC in stroops (7 decimals).
@@ -1436,4 +1436,408 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         client.try_contribute(&setup.member(0), &setup.amount, &1u32),
         Err(Ok(GroupError::ArithmeticOverflow))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Reentrancy across rounds (#44)
+// ---------------------------------------------------------------------------
+
+#[contract]
+pub struct ReentrantToken;
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn init(e: Env, admin: Address, balances: Map<Address, i128>, group: Address, mode: u32) {
+        e.storage()
+            .instance()
+            .set(&Symbol::new(&e, "admin"), &admin);
+        e.storage()
+            .instance()
+            .set(&Symbol::new(&e, "bals"), &balances);
+        e.storage()
+            .instance()
+            .set(&Symbol::new(&e, "group"), &group);
+        e.storage().instance().set(&Symbol::new(&e, "mode"), &mode);
+        e.storage()
+            .instance()
+            .set(&Symbol::new(&e, "reentered"), &false);
+    }
+
+    pub fn set_mode(e: Env, mode: u32) {
+        e.storage().instance().set(&Symbol::new(&e, "mode"), &mode);
+        e.storage()
+            .instance()
+            .set(&Symbol::new(&e, "reentered"), &false);
+    }
+
+    pub fn expect_round(e: Env, round: u32) {
+        e.storage()
+            .instance()
+            .set(&Symbol::new(&e, "expected_round"), &round);
+    }
+
+    pub fn observed_paid(e: Env) -> bool {
+        e.storage()
+            .instance()
+            .get(&Symbol::new(&e, "observed_paid"))
+            .unwrap_or(false)
+    }
+
+    pub fn balance(e: Env, addr: Address) -> i128 {
+        let bals: Map<Address, i128> = e
+            .storage()
+            .instance()
+            .get(&Symbol::new(&e, "bals"))
+            .unwrap();
+        bals.get(addr).unwrap_or(0)
+    }
+
+    fn debit(e: &Env, from: &Address, amount: i128) {
+        let key = Symbol::new(e, "bals");
+        let mut bals: Map<Address, i128> = e.storage().instance().get(&key).unwrap();
+        let cur: i128 = bals.get(from.clone()).unwrap_or(0);
+        assert!(cur >= amount, "insufficient balance");
+        bals.set(from.clone(), cur - amount);
+        e.storage().instance().set(&key, &bals);
+    }
+
+    fn credit(e: &Env, to: &Address, amount: i128) {
+        let key = Symbol::new(e, "bals");
+        let mut bals: Map<Address, i128> = e.storage().instance().get(&key).unwrap();
+        let cur: i128 = bals.get(to.clone()).unwrap_or(0);
+        bals.set(to.clone(), cur + amount);
+        e.storage().instance().set(&key, &bals);
+    }
+
+    fn maybe_reenter(e: &Env, from: Address, amount: i128) {
+        let rkey = Symbol::new(e, "reentered");
+        let done: bool = e.storage().instance().get(&rkey).unwrap_or(false);
+        if done {
+            return;
+        }
+        e.storage().instance().set(&rkey, &true);
+        let group: Address = e
+            .storage()
+            .instance()
+            .get(&Symbol::new(e, "group"))
+            .unwrap();
+        let mode: u32 = e
+            .storage()
+            .instance()
+            .get(&Symbol::new(e, "mode"))
+            .unwrap_or(0);
+
+        if mode == 3 {
+            let expected: u32 = e
+                .storage()
+                .instance()
+                .get(&Symbol::new(e, "expected_round"))
+                .unwrap();
+            let paid: bool = e.as_contract(&group, || {
+                e.storage()
+                    .persistent()
+                    .get(&DataKey::PayoutExecuted(expected))
+                    .unwrap_or(false)
+            });
+            e.storage()
+                .instance()
+                .set(&Symbol::new(e, "observed_paid"), &paid);
+        }
+
+        let args: Vec<Val>;
+        let func: &str;
+        if mode == 1 {
+            func = "contribute";
+            args = vec![e, from.into_val(e), amount.into_val(e)];
+        } else if mode == 2 || mode == 3 {
+            func = "execute_payout";
+            args = vec![e];
+        } else {
+            return;
+        }
+
+        let code: u32 = match e.try_invoke_contract::<(), soroban_sdk::Error>(
+            &group,
+            &Symbol::new(e, func),
+            args,
+        ) {
+            Ok(Ok(())) => 1,
+            Ok(Err(_)) => 200,
+            Err(Ok(_)) => 4,
+            Err(Err(_)) => 200,
+        };
+        e.storage()
+            .instance()
+            .set(&Symbol::new(e, "nested_result"), &code);
+    }
+
+    pub fn get_nested_result(e: Env) -> u32 {
+        e.storage()
+            .instance()
+            .get(&Symbol::new(&e, "nested_result"))
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn transfer(e: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        Self::maybe_reenter(&e, from.clone(), amount);
+        Self::debit(&e, &from, amount);
+        Self::credit(&e, &to, amount);
+    }
+
+    pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        Self::maybe_reenter(&e, from.clone(), amount);
+        Self::debit(&e, &from, amount);
+        Self::credit(&e, &to, amount);
+    }
+
+    pub fn approve(e: Env, from: Address, spender: Address, amount: i128, _live_until: u32) {
+        from.require_auth();
+        let _ = (spender, amount);
+        let _ = e;
+    }
+}
+
+struct ReentrantSetup {
+    env: Env,
+    group_id: Address,
+    token_id: Address,
+    treasury: Address,
+    members: Vec<Address>,
+    amount: i128,
+    capacity: u32,
+}
+
+fn setup_reentrant(mode: u32) -> ReentrantSetup {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_id = env.register(ReentrantToken, ());
+
+    let capacity = 3u32;
+    let amount = 10 * ONE_USDC;
+
+    let mut members = Vec::new(&env);
+    let mut bals = Map::new(&env);
+    let mut i = 0;
+    while i < capacity {
+        let member = Address::generate(&env);
+        bals.set(member.clone(), amount * 5);
+        members.push_back(member);
+        i += 1;
+    }
+
+    let group_id = env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token_id.clone(),
+            treasury.clone(),
+            amount,
+            capacity,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+
+    env.invoke_contract::<()>(
+        &token_id,
+        &Symbol::new(&env, "init"),
+        vec![
+            &env,
+            admin.into_val(&env),
+            bals.into_val(&env),
+            group_id.clone().into_val(&env),
+            mode.into_val(&env),
+        ],
+    );
+
+    ReentrantSetup {
+        env,
+        group_id,
+        token_id,
+        treasury,
+        members,
+        amount,
+        capacity,
+    }
+}
+
+#[test]
+fn execute_payout_reentrant_across_rounds_no_double_pay() {
+    // ---- attack run -------------------------------------------------------
+    let attack = setup_reentrant(0);
+    let a_client = GroupContractClient::new(&attack.env, &attack.group_id);
+    let a_token = token::Client::new(&attack.env, &attack.token_id);
+
+    let mut i = 0;
+    while i < attack.capacity {
+        a_client.join(&attack.members.get(i).unwrap());
+        i += 1;
+    }
+    a_client.start();
+    let mut j = 0;
+    while j < attack.capacity {
+        a_client.contribute(&attack.members.get(j).unwrap(), &attack.amount, &1);
+        j += 1;
+    }
+    attack.env.invoke_contract::<()>(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "expect_round"),
+        vec![&attack.env, 1u32.into_val(&attack.env)],
+    );
+    // Arm mode 3 so the re-entry fires during execute_payout.
+    attack.env.invoke_contract::<()>(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "set_mode"),
+        vec![&attack.env, 3u32.into_val(&attack.env)],
+    );
+
+    let recipient = attack.members.get(0).unwrap();
+    let recipient_before = a_token.balance(&recipient);
+    let treasury_before = a_token.balance(&attack.treasury);
+
+    // Round 1 payout; the token re-enters mid-transfer.
+    a_client.execute_payout();
+
+    let emitted = attack
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&attack.group_id);
+    let pool = 3 * attack.amount;
+    let fee = pool * (MAX_FEE_BPS as i128) / 10_000;
+    let recipient_amount = pool - fee;
+    let expected_payout = PayoutExecuted {
+        recipient: recipient.clone(),
+        round: 1,
+        recipient_amount,
+    }
+    .to_xdr(&attack.env, &attack.group_id);
+    let mut payout_event_count = 0;
+    for e in emitted.events().iter() {
+        if *e == expected_payout {
+            payout_event_count += 1;
+        }
+    }
+    assert_eq!(
+        payout_event_count, 1,
+        "expected exactly one PayoutExecuted event for round 1"
+    );
+
+    let observed: bool = attack.env.invoke_contract(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "observed_paid"),
+        vec![&attack.env],
+    );
+    assert!(observed, "round 1 effects must precede the token transfer");
+
+    let nested_code: u32 = attack.env.invoke_contract(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "get_nested_result"),
+        vec![&attack.env],
+    );
+    assert_eq!(nested_code, 4, "nested execute_payout should be rejected");
+
+    assert_eq!(
+        a_token.balance(&recipient),
+        recipient_before + recipient_amount,
+        "round 1 paid out more than once"
+    );
+    assert_eq!(a_token.balance(&attack.treasury), treasury_before + fee);
+
+    // Round 2 was not paid early or twice: still collecting.
+    assert_eq!(a_client.get_current_round(), 2);
+    assert_eq!(
+        a_client.get_group().round_phase,
+        RoundPhase::WaitingForContributions
+    );
+    assert_eq!(
+        a_client.get_round(&2u32).phase,
+        RoundPhase::WaitingForContributions
+    );
+
+    // Finish round 2 honestly: all three contribute, then payout.
+    a_client.contribute(&attack.members.get(0).unwrap(), &attack.amount, &2u32);
+    a_client.contribute(&attack.members.get(1).unwrap(), &attack.amount, &2u32);
+    a_client.contribute(&attack.members.get(2).unwrap(), &attack.amount, &2u32);
+    let r2_recipient = attack.members.get(1).unwrap();
+    let r2_before = a_token.balance(&r2_recipient);
+    attack.env.invoke_contract::<()>(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "expect_round"),
+        vec![&attack.env, 2u32.into_val(&attack.env)],
+    );
+    attack.env.invoke_contract::<()>(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "set_mode"),
+        vec![&attack.env, 3u32.into_val(&attack.env)],
+    );
+    a_client.execute_payout();
+    let observed: bool = attack.env.invoke_contract(
+        &attack.token_id,
+        &Symbol::new(&attack.env, "observed_paid"),
+        vec![&attack.env],
+    );
+    assert!(observed, "round 2 effects must precede the token transfer");
+    assert_eq!(
+        a_token.balance(&r2_recipient),
+        r2_before + recipient_amount,
+        "round 2 paid out more than once"
+    );
+    assert_eq!(a_client.get_current_round(), 3);
+
+    // ---- control run: same logical operations, passive token --------------
+    let control = setup_reentrant(0);
+    let c_client = GroupContractClient::new(&control.env, &control.group_id);
+    let c_token = token::Client::new(&control.env, &control.token_id);
+
+    let mut k = 0;
+    while k < control.capacity {
+        c_client.join(&control.members.get(k).unwrap());
+        k += 1;
+    }
+    c_client.start();
+    let mut m = 0;
+    while m < control.capacity {
+        c_client.contribute(&control.members.get(m).unwrap(), &control.amount, &1);
+        m += 1;
+    }
+    c_client.execute_payout();
+
+    c_client.contribute(&control.members.get(0).unwrap(), &control.amount, &2u32);
+    c_client.contribute(&control.members.get(1).unwrap(), &control.amount, &2u32);
+    c_client.contribute(&control.members.get(2).unwrap(), &control.amount, &2u32);
+    c_client.execute_payout();
+
+    // ---- the attack run matches the clean run ------------------------------
+    let mut n = 0;
+    while n < attack.capacity {
+        assert_eq!(
+            a_token.balance(&attack.members.get(n).unwrap()),
+            c_token.balance(&control.members.get(n).unwrap()),
+            "member balance mismatch after cross-round attack"
+        );
+        n += 1;
+    }
+    assert_eq!(
+        a_token.balance(&attack.treasury),
+        c_token.balance(&control.treasury),
+        "treasury balance mismatch after cross-round attack"
+    );
+    assert_eq!(
+        a_token.balance(&attack.group_id),
+        c_token.balance(&control.group_id),
+        "group balance mismatch"
+    );
+    assert_eq!(a_client.get_current_round(), c_client.get_current_round());
+    assert_eq!(
+        a_client.get_group().round_phase,
+        c_client.get_group().round_phase
+    );
+    assert_eq!(a_client.get_pool_balance(), c_client.get_pool_balance());
 }
