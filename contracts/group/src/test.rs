@@ -1326,6 +1326,55 @@ fn get_round_reports_an_unstarted_round_safely() {
 }
 
 #[test]
+fn get_round_reports_no_recipient_before_group_starts() {
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    setup.client().join(&setup.member(0));
+
+    // Member 1 joined, but group has not started (current_round == 0)
+    let r1 = setup.client().get_round(&1u32);
+    assert_eq!(r1.recipient, None);
+}
+
+#[test]
+fn get_round_reports_no_recipient_for_future_rounds() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Round 1 is currently active: recipient is Some
+    let r1 = client.get_round(&1u32);
+    assert_eq!(r1.recipient, Some(setup.member(0)));
+    assert!(!r1.payout_executed);
+
+    // Future rounds 2 and 3 must report recipient: None
+    let r2 = client.get_round(&2u32);
+    assert_eq!(r2.recipient, None);
+    assert!(!r2.payout_executed);
+
+    let r3 = client.get_round(&3u32);
+    assert_eq!(r3.recipient, None);
+    assert!(!r3.payout_executed);
+
+    // Execute round 1 payout
+    setup.contribute_all(1);
+    client.execute_payout();
+
+    // Now round 1 is completed: still reports recipient
+    let r1_after = client.get_round(&1u32);
+    assert_eq!(r1_after.recipient, Some(setup.member(0)));
+    assert!(r1_after.payout_executed);
+
+    // Round 2 is now active: reports recipient
+    let r2_after = client.get_round(&2u32);
+    assert_eq!(r2_after.recipient, Some(setup.member(1)));
+    assert!(!r2_after.payout_executed);
+
+    // Round 3 is still in the future: reports None
+    let r3_after = client.get_round(&3u32);
+    assert_eq!(r3_after.recipient, None);
+    assert!(!r3_after.payout_executed);
+}
+
+#[test]
 fn get_pool_balance_is_zero_before_the_group_starts() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
     assert_eq!(setup.client().get_pool_balance(), 0);
