@@ -341,8 +341,21 @@ fn create_group_rejects_invalid_parameters() {
         client.try_create_group(&creator, &token, &10_000_000i128, &0u32, &604_800u64),
         Err(Ok(FactoryError::InvalidMemberCapacity))
     );
+    // Out-of-range capacity returns InvalidMemberCapacity regardless of contribution amount
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &0i128, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
     assert_eq!(
         client.try_create_group(&creator, &token, &10_000_000i128, &1u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &1u32, &604_800u64),
         Err(Ok(FactoryError::InvalidMemberCapacity))
     );
     assert_eq!(
@@ -356,7 +369,22 @@ fn create_group_rejects_invalid_parameters() {
         Err(Ok(FactoryError::InvalidMemberCapacity))
     );
     assert_eq!(
+        client.try_create_group(
+            &creator,
+            &token,
+            &i128::MAX,
+            &(MAX_MEMBERS + 1),
+            &604_800u64
+        ),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+    assert_eq!(
         client.try_create_group(&creator, &token, &10_000_000i128, &3u32, &0u64),
+        Err(Ok(FactoryError::InvalidFrequency))
+    );
+    // Zero frequency returns InvalidFrequency even if contribution amount overflows
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &3u32, &0u64),
         Err(Ok(FactoryError::InvalidFrequency))
     );
     assert_eq!(
