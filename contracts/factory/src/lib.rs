@@ -122,18 +122,27 @@ pub struct GroupCreated {
 }
 
 /// The protocol fee applied to newly created groups changed.
+///
+/// Carries the value it replaced so an indexer can reconstruct the history of
+/// configuration changes instead of inferring them from discontinuities.
 #[contractevent(topics = ["susu", "fee_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeUpdated {
+    pub previous_fee_bps: u32,
     pub fee_bps: u32,
 }
 
 /// The treasury for newly created groups changed.
+///
+/// `previous_treasury` rides in data rather than as a topic: the event already
+/// spends three topics on the prefix and the new treasury, and a fourth would
+/// leave no room under the four-topic limit once the contract address counts.
 #[contractevent(topics = ["susu", "treasury_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreasuryUpdated {
     #[topic]
     pub treasury: Address,
+    pub previous_treasury: Address,
 }
 
 /// New group creation was paused or unpaused.
@@ -292,10 +301,15 @@ impl FactoryContract {
 
         let storage = env.storage().instance();
         let mut config = load_config(&env)?;
+        let previous_fee_bps = config.fee_bps;
         config.fee_bps = fee_bps;
         storage.set(&DataKey::Config, &config);
 
-        FeeUpdated { fee_bps }.publish(&env);
+        FeeUpdated {
+            previous_fee_bps,
+            fee_bps,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -312,10 +326,15 @@ impl FactoryContract {
         if treasury == config.admin || treasury == env.current_contract_address() {
             return Err(FactoryError::InvalidTreasury);
         }
+        let previous_treasury = config.treasury.clone();
         config.treasury = treasury.clone();
         storage.set(&DataKey::Config, &config);
 
-        TreasuryUpdated { treasury }.publish(&env);
+        TreasuryUpdated {
+            treasury,
+            previous_treasury,
+        }
+        .publish(&env);
         Ok(())
     }
 
