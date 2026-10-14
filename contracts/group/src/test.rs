@@ -487,7 +487,7 @@ fn join_assigns_sequential_positions_and_is_emitted() {
         &setup.env,
         [setup.member(0), setup.member(1), setup.member(2)],
     );
-    assert_eq!(client.get_payout_order(), expected_order);
+    assert_eq!(client.try_get_payout_order(), Ok(Ok(expected_order)));
 
     let expected = MemberJoined {
         member: setup.member(1),
@@ -522,6 +522,30 @@ fn join_rejects_a_duplicate_member() {
     assert_eq!(
         client.try_join(&setup.member(0)),
         Err(Ok(GroupError::AlreadyMember))
+    );
+}
+
+#[test]
+fn get_payout_order_returns_member_entry_missing_when_a_position_has_archived() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    setup.join_all();
+
+    // Simulate the middle member's persistent entry having been archived (the
+    // pre-#33 read path would have made this possible for an idle group).
+    setup.env.as_contract(&setup.group_id, || {
+        setup
+            .env
+            .storage()
+            .persistent()
+            .remove(&DataKey::MemberAt(2));
+    });
+
+    assert_eq!(
+        client.try_get_payout_order(),
+        Err(Ok(GroupError::MemberEntryMissing)),
+        "a position within MemberCount whose MemberAt entry is missing must surface as a typed error"
     );
 }
 

@@ -256,6 +256,12 @@ pub enum GroupError {
     InvalidTreasury = 20,
     /// Token address cannot be the group contract address.
     InvalidToken = 21,
+    /// A position within `MemberCount` has no live `MemberAt` entry. Defensive:
+    /// unreachable for a well-formed group, but an idle group whose entries have
+    /// been archived (or one whose join/start sequence was interrupted) can hit
+    /// this. Surfaced as a typed error so an off-chain consumer can detect
+    /// truncation rather than read a silently shortened payout order.
+    MemberEntryMissing = 22,
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +746,14 @@ impl GroupContract {
 
     /// The immutable payout order, in join order. Position `n` (1-based) is paid in
     /// round `n`.
-    pub fn get_payout_order(env: Env) -> Vec<Address> {
+    ///
+    /// Returns `MemberEntryMissing` if any position in `1..=member_count` has no
+    /// live `MemberAt` entry. With the read-side TTL extension in place (issue
+    /// #33) a position only goes missing if the entry has actually been
+    /// archived or was never written; reporting it as a typed error keeps an
+    /// off-chain consumer from silently reading a shorter payout order.
+    pub fn get_payout_order(env: Env) -> Result<Vec<Address>, GroupError> {
+        extend_instance_ttl(&env);
         let count: u32 = env
             .storage()
             .instance()
@@ -750,12 +763,17 @@ impl GroupContract {
         let mut order = Vec::new(&env);
         let mut position = 1u32;
         while position <= count {
-            if let Some(address) = persistent.get(&DataKey::MemberAt(position)) {
-                order.push_back(address);
+            let key = DataKey::MemberAt(position);
+            match persistent.get(&key) {
+                Some(address) => {
+                    extend_persistent_ttl(&env, &key);
+                    order.push_back(address);
+                }
+                None => return Err(GroupError::MemberEntryMissing),
             }
             position += 1;
         }
-        order
+        Ok(order)
     }
 
     /// Observable state of a specific round.
@@ -918,3 +936,10 @@ fn extend_persistent_ttl(env: &Env, key: &DataKey) {
 }
 
 mod test;
+
+/// Re-entrant token fixture used by the integration tests in
+/// `tests/reentrant_token_tests.rs`. It is `pub` so the integration-test
+/// crate (which compiles this crate without `cfg(test)`) can reach it.
+/// Production callers do not need to import it; the SAC interface it
+/// mirrors is what the Group contract depends on.
+pub mod reentrant_token;
