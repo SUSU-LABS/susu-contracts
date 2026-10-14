@@ -764,25 +764,28 @@ impl GroupContract {
         let payout_executed: bool = persistent
             .get(&DataKey::PayoutExecuted(round))
             .unwrap_or(false);
-        let recipient: Option<Address> = persistent.get(&DataKey::MemberAt(round));
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let round_started = current_round > 0 && round <= current_round;
+        let recipient: Option<Address> = if payout_executed || round_started {
+            persistent.get(&DataKey::MemberAt(round))
+        } else {
+            None
+        };
 
         // A round that has not started yet reports its phase as waiting.
         let phase = if payout_executed {
             RoundPhase::PayoutExecuted
-        } else {
-            let current_round: u32 = env
-                .storage()
+        } else if round == current_round {
+            env.storage()
                 .instance()
-                .get(&DataKey::CurrentRound)
-                .unwrap_or(0);
-            if round == current_round {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::RoundPhase)
-                    .unwrap_or(RoundPhase::WaitingForContributions)
-            } else {
-                RoundPhase::WaitingForContributions
-            }
+                .get(&DataKey::RoundPhase)
+                .unwrap_or(RoundPhase::WaitingForContributions)
+        } else {
+            RoundPhase::WaitingForContributions
         };
 
         RoundInfo {

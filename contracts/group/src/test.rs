@@ -1323,6 +1323,30 @@ fn get_round_reports_an_unstarted_round_safely() {
     assert_eq!(round.contribution_count, 0);
     assert!(!round.payout_executed);
     assert_eq!(round.recipient, None);
+
+    // Even if members have joined, before group starts all rounds report recipient: None
+    setup.join_all();
+    let round1 = setup.client().get_round(&1u32);
+    assert_eq!(round1.recipient, None);
+}
+
+#[test]
+fn get_round_reports_no_recipient_for_future_round_in_active_group() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Round 1 is active, so round 1 returns its recipient
+    let round1 = client.get_round(&1u32);
+    assert_eq!(round1.recipient, Some(setup.member(0)));
+
+    // Rounds 2 and 3 have not started yet, so they report recipient: None
+    let round2 = client.get_round(&2u32);
+    assert_eq!(round2.recipient, None);
+    assert_eq!(round2.phase, RoundPhase::WaitingForContributions);
+
+    let round3 = client.get_round(&3u32);
+    assert_eq!(round3.recipient, None);
+    assert_eq!(round3.phase, RoundPhase::WaitingForContributions);
 }
 
 #[test]
