@@ -1,10 +1,10 @@
-#![cfg(test)]
+﻿#![cfg(test)]
 
 //! Tests for the Susu Group contract.
 //!
-//! Structure mirrors the specification's testing requirements (v3 §25.1, §25.2):
+//! Structure mirrors the specification's testing requirements (v3 Â§25.1, Â§25.2):
 //! happy paths, every negative path, boundary values, the final round, and the
-//! financial invariants. The canonical financial case is 3 members × 10 USDC:
+//! financial invariants. The canonical financial case is 3 members Ã— 10 USDC:
 //! pool 30 USDC, fee 0.15 USDC, recipient 29.85 USDC.
 //!
 //! Money is expressed in the token's smallest unit. USDC has 7 decimal places, so
@@ -748,7 +748,7 @@ fn contribute_fails_when_the_member_cannot_pay() {
 }
 
 // ---------------------------------------------------------------------------
-// Payouts — including the WAIT behaviour
+// Payouts â€” including the WAIT behaviour
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -802,7 +802,7 @@ fn execute_payout_cannot_execute_the_same_round_twice() {
     setup.contribute_all(1);
 
     client.execute_payout();
-    // Round 2 has begun, so a second payout is not "already executed" for round 1 —
+    // Round 2 has begun, so a second payout is not "already executed" for round 1 â€”
     // it is simply a payout for a round that is not funded yet.
     assert_eq!(
         client.try_execute_payout(),
@@ -814,7 +814,7 @@ fn execute_payout_cannot_execute_the_same_round_twice() {
 
 #[test]
 fn execute_payout_splits_the_pool_exactly_and_advances_the_round() {
-    // The canonical case from the specification: 3 × 10 USDC = 30 USDC.
+    // The canonical case from the specification: 3 Ã— 10 USDC = 30 USDC.
     let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
     let client = setup.client();
     let token_client = setup.token_client();
@@ -928,7 +928,7 @@ fn final_round_completes_the_group_exactly_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Financial end-to-end (v3 §25.2)
+// Financial end-to-end (v3 Â§25.2)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -948,7 +948,7 @@ fn financial_e2e_three_members_ten_usdc_each() {
 
     setup.run_to_completion();
 
-    // Every member pays 3 × 10 USDC and receives exactly one 29.85 USDC payout.
+    // Every member pays 3 Ã— 10 USDC and receives exactly one 29.85 USDC payout.
     let mut index = 0;
     while index < 3 {
         let expected = start_balances.get(index).unwrap() - 30 * ONE_USDC + 298_500_000;
@@ -1436,4 +1436,32 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         client.try_contribute(&setup.member(0), &setup.amount, &1u32),
         Err(Ok(GroupError::ArithmeticOverflow))
     );
+}
+
+
+#[test]
+fn round_pool_survives_past_threshold_via_read_path() {
+    use soroban_sdk::testutils::Ledger as _;
+    let setup = setup_started(2, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Record a real contribution so the round pool is non-zero and the
+    // RoundPool persistent entry actually exists.
+    client.contribute(&setup.member(0), &setup.amount, &1u32);
+
+    // Advance past the persistent TTL threshold. If `get_round` stops
+    // extending DataKey::RoundPool, the entry would be archived and the
+    // assertions below would no longer hold.
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(PERSISTENT_TTL_THRESHOLD + 10);
+
+    let round = client.get_round(&1u32);
+    assert_eq!(round.round, 1);
+    assert_eq!(round.pool, setup.amount);
+    assert_eq!(round.contribution_count, 1);
+
+    // get_pool_balance reads the same persistent entry through a second view.
+    assert_eq!(client.get_pool_balance(), setup.amount);
 }
