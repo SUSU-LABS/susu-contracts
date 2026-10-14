@@ -376,6 +376,60 @@ fn constructor_rejects_capacity_above_the_maximum() {
 }
 
 #[test]
+#[should_panic]
+fn constructor_reports_invalid_capacity_before_contribution_overflow() {
+    // Out-of-range capacity must surface InvalidMemberCapacity even when the
+    // contribution_amount would also overflow the multiplication. The capacity
+    // check runs first, so the most specific error wins. With the old ordering
+    // (contribution check first), this case panicked with
+    // InvalidContributionAmount instead.
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            u32::MAX,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
+fn constructor_reports_invalid_capacity_for_zero_with_large_amount() {
+    // Zero capacity is a capacity error, regardless of contribution_amount.
+    // Using i128::MAX ensures the contribution check would also trigger on
+    // overflow, so the capacity error must take precedence.
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            0u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
 fn constructor_accepts_the_capacity_boundaries() {
     // MIN_MEMBERS is the smallest valid group.
     let smallest = setup(MIN_MEMBERS, ONE_USDC, MAX_FEE_BPS);
