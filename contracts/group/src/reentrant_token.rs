@@ -6,6 +6,12 @@
 //! `get_nested_result` (1 = nested success, 4 = contract error,
 //! 200 = host abort).
 //!
+//! Mode 3 additionally carries a state probe: at the external transfer
+//! boundary it reads the Group's persistent storage and records (via
+//! `observed_paid`, armed with `expect_round`) whether the expected round's
+//! payout effects were committed before the transfer — a direct positive
+//! check of effects-before-interactions ordering.
+//!
 //! The token behaves like a normal ledgered token except that on the first
 //! `transfer` / `transfer_from` it performs a single re-entrant call back
 //! into the Group contract before completing the ledger update. A
@@ -14,6 +20,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{contract, contractimpl, vec, Address, Env, IntoVal, Map, Symbol, Val, Vec};
+
+use super::DataKey;
 
 #[contract]
 pub struct ReentrantToken;
@@ -43,6 +51,25 @@ impl ReentrantToken {
         e.storage()
             .instance()
             .set(&Symbol::new(&e, "reentered"), &false);
+    }
+
+    /// Tells the mode-3 probe which round's `PayoutExecuted` mark to look for
+    /// in the Group's persistent storage during the next re-entrant transfer.
+    pub fn expect_round(e: Env, round: u32) {
+        e.storage()
+            .instance()
+            .set(&Symbol::new(&e, "expected_round"), &round);
+    }
+
+    /// Whether the mode-3 probe observed the expected round's payout effects
+    /// already committed in the Group's storage *before* the external
+    /// transfer ran. `false` means the effects were not yet applied at
+    /// interaction time (effects-after-interactions ordering).
+    pub fn observed_paid(e: Env) -> bool {
+        e.storage()
+            .instance()
+            .get(&Symbol::new(&e, "observed_paid"))
+            .unwrap_or(false)
     }
 
     pub fn balance(e: Env, addr: Address) -> i128 {
@@ -104,6 +131,28 @@ impl ReentrantToken {
             args = vec![e];
         } else {
             return;
+        }
+        // Mode-3 state probe: at the external transfer boundary, read the
+        // Group's own persistent storage (via its contract frame) and record
+        // whether the expected round's payout effects were already committed
+        // BEFORE the transfer. A direct, positive check of
+        // effects-before-interactions ordering: if the group transferred
+        // first and marked later, `observed_paid` stays false.
+        if mode == 3 {
+            let expected: u32 = e
+                .storage()
+                .instance()
+                .get(&Symbol::new(e, "expected_round"))
+                .unwrap_or(0);
+            let paid: bool = e.as_contract(&group, || {
+                e.storage()
+                    .persistent()
+                    .get(&DataKey::PayoutExecuted(expected))
+                    .unwrap_or(false)
+            });
+            e.storage()
+                .instance()
+                .set(&Symbol::new(e, "observed_paid"), &paid);
         }
         let code: u32 = match e.try_invoke_contract::<(), soroban_sdk::Error>(
             &group,
