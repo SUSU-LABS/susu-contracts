@@ -1437,3 +1437,54 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         Err(Ok(GroupError::ArithmeticOverflow))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #36 acceptance: out-of-range member_capacity must surface as
+// `InvalidMemberCapacity`, never as `InvalidContributionAmount`.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "InvalidMemberCapacity")]
+fn constructor_zero_member_capacity_surfaces_as_invalid_member_capacity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            ONE_USDC,
+            0u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "InvalidMemberCapacity")]
+fn constructor_overflowing_member_capacity_surfaces_as_invalid_member_capacity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            ONE_USDC,
+            MAX_MEMBERS + 1,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
