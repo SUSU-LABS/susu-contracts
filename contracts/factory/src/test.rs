@@ -372,6 +372,40 @@ fn create_group_rejects_invalid_parameters() {
 }
 
 #[test]
+fn create_group_reports_invalid_capacity_before_contribution_overflow() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let creator = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Out-of-range capacity must surface InvalidMemberCapacity even when the
+    // contribution_amount would also overflow the multiplication: the most
+    // specific error wins.
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &u32::MAX, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+    assert_eq!(
+        client.try_create_group(
+            &creator,
+            &token,
+            &i128::MAX,
+            &(MAX_MEMBERS + 1),
+            &604_800u64
+        ),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+    // Zero capacity is also a capacity error, regardless of contribution_amount.
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &0i128, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+}
+
+#[test]
 fn create_group_is_refused_while_paused() {
     let (env, _, _, client) = setup(MAX_FEE_BPS);
     let creator = Address::generate(&env);
