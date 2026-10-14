@@ -125,6 +125,7 @@ pub struct GroupCreated {
 #[contractevent(topics = ["susu", "fee_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeUpdated {
+    pub previous_fee_bps: u32,
     pub fee_bps: u32,
 }
 
@@ -133,6 +134,7 @@ pub struct FeeUpdated {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreasuryUpdated {
     #[topic]
+    pub previous_treasury: Address,
     pub treasury: Address,
 }
 
@@ -295,7 +297,10 @@ impl FactoryContract {
         config.fee_bps = fee_bps;
         storage.set(&DataKey::Config, &config);
 
-        FeeUpdated { fee_bps }.publish(&env);
+        let prev = config.fee_bps;
+        config.fee_bps = fee_bps;
+        storage.set(&DataKey::Config, &config);
+        FeeUpdated { previous_fee_bps: prev, fee_bps }.publish(&env);
         Ok(())
     }
 
@@ -308,14 +313,10 @@ impl FactoryContract {
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let mut config = load_config(&env)?;
-        if treasury == config.admin || treasury == env.current_contract_address() {
-            return Err(FactoryError::InvalidTreasury);
-        }
-        config.treasury = treasury.clone();
+        let prev = config.treasury;
+        config.treasury = treasury;
         storage.set(&DataKey::Config, &config);
-
-        TreasuryUpdated { treasury }.publish(&env);
+        TreasuryUpdated { previous_treasury: prev, treasury }.publish(&env);
         Ok(())
     }
 
