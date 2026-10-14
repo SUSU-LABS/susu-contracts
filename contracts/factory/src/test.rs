@@ -60,6 +60,28 @@ fn constructor_rejects_zero_fee() {
     setup(0);
 }
 
+#[test]
+fn constructor_publishes_factory_initialized() {
+    // fee_bps must be within (0, MAX_FEE_BPS=50]: 150 would make the
+    // constructor panic with InvalidFeeBps before publishing anything.
+    let (env, admin, treasury, client) = setup(25);
+    // `events().all()` reflects the most recent invocation: capture right after
+    // `setup` runs the constructor, before any other contract call.
+    let emitted = env.events().all().filter_by_contract(&client.address);
+
+    let expected = FactoryInitialized {
+        admin,
+        treasury,
+        fee_bps: 25,
+        group_wasm_hash: BytesN::from_array(&env, &[7u8; 32]),
+    }
+    .to_xdr(&env, &client.address);
+    assert!(
+        emitted.events().contains(&expected),
+        "constructor should publish FactoryInitialized with the initial config"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fee configuration
 // ---------------------------------------------------------------------------
