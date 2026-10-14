@@ -1485,6 +1485,11 @@ fn read_paths_extend_ttl_across_idle_period() {
     assert_eq!(round.contribution_count, 3);
     assert!(client.get_pool_balance() > 0);
     assert_eq!(client.get_current_recipient(), member);
+    // is_contribution_complete also extends RoundContributionCount(1);
+    // get_status/get_token extend instance TTL (no-trap smoke coverage).
+    assert!(client.is_contribution_complete());
+    let _ = client.get_status();
+    let _ = client.get_token();
 
     // Each touched entry was extended to idle_ledger + 518_400.
     for key in [

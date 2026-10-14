@@ -870,6 +870,7 @@ impl GroupContract {
 
     /// Whether every member has contributed to the current round.
     pub fn is_contribution_complete(env: Env) -> bool {
+        extend_instance_ttl(&env);
         let storage = env.storage().instance();
         let config: GroupConfig = match storage.get(&DataKey::Config) {
             Some(config) => config,
@@ -879,16 +880,15 @@ impl GroupContract {
         if round == 0 {
             return false;
         }
-        let count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RoundContributionCount(round))
-            .unwrap_or(0);
+        let key = DataKey::RoundContributionCount(round);
+        let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        extend_persistent_ttl_if_exists(&env, &key);
         count >= config.member_capacity
     }
 
     /// The group's lifecycle status.
     pub fn get_status(env: Env) -> Status {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Status)
@@ -897,6 +897,7 @@ impl GroupContract {
 
     /// The single token this group accepts.
     pub fn get_token(env: Env) -> Address {
+        extend_instance_ttl(&env);
         let config: GroupConfig = env.storage().instance().get(&DataKey::Config).unwrap();
         config.token
     }
