@@ -287,6 +287,7 @@ to filter by them.
 | `FeeUpdated` | `susu`, `fee_updated` | `fee_bps` |
 | `TreasuryUpdated` | `susu`, `treasury_updated`, `treasury` | — |
 | `PauseUpdated` | `susu`, `pause_updated` | `paused` |
+| `FactoryInitialized` | `susu`, `factory_initialized`, `admin` | `treasury`, `fee_bps`, `group_wasm_hash` |
 
 **Group**
 

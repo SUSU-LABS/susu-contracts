@@ -49,6 +49,32 @@ fn constructor_stores_configuration() {
 }
 
 #[test]
+fn constructor_emits_factory_initialized_with_the_initial_configuration() {
+    let (env, admin, treasury, client) = setup(MAX_FEE_BPS);
+    let emitted = env.events().all().filter_by_contract(&client.address);
+
+    let expected = FactoryInitialized {
+        admin,
+        treasury,
+        fee_bps: MAX_FEE_BPS,
+        group_wasm_hash: BytesN::from_array(&env, &[7u8; 32]),
+    }
+    .to_xdr(&env, &client.address);
+    assert!(
+        emitted.events().contains(&expected),
+        "deployment must publish the full initial configuration exactly as constructed"
+    );
+
+    // Exactly once: the constructor is the only emitter, and `setup` performs
+    // no other contract call that could publish anything.
+    assert_eq!(
+        emitted.events().len(),
+        1,
+        "construction publishes exactly one event"
+    );
+}
+
+#[test]
 #[should_panic]
 fn constructor_rejects_fee_above_the_protocol_maximum() {
     setup(MAX_FEE_BPS + 1);
