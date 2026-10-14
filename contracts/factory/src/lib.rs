@@ -143,6 +143,21 @@ pub struct PauseUpdated {
     pub paused: bool,
 }
 
+/// The Factory was deployed with its initial configuration.
+///
+/// Mirrors `GroupInitialized` on the Group contract: the on-chain history of who
+/// owns the protocol and which parameters were frozen at deployment is otherwise
+/// only inferable from the first `FeeUpdated`/`TreasuryUpdated` delta, and the
+/// `paused: false` start state has no event at all.
+#[contractevent(topics = ["susu", "factory_initialized"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactoryInitialized {
+    pub admin: Address,
+    pub treasury: Address,
+    pub fee_bps: u32,
+    pub group_wasm_hash: BytesN<32>,
+}
+
 /// The Susu Factory contract type.
 #[contract]
 pub struct FactoryContract;
@@ -170,14 +185,22 @@ impl FactoryContract {
             soroban_sdk::panic_with_error!(&env, FactoryError::InvalidTreasury);
         }
         let config = FactoryConfig {
-            admin,
-            treasury,
+            admin: admin.clone(),
+            treasury: treasury.clone(),
             fee_bps,
-            group_wasm_hash,
+            group_wasm_hash: group_wasm_hash.clone(),
             paused: false,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::GroupCount, &0u32);
+
+        FactoryInitialized {
+            admin,
+            treasury,
+            fee_bps,
+            group_wasm_hash,
+        }
+        .publish(&env);
     }
 
     /// Deploy and register a new group.

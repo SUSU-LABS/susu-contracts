@@ -432,3 +432,55 @@ fn set_treasury_rejects_admin_or_factory_address() {
     assert!(client.try_set_treasury(&valid_treasury).is_ok());
     assert_eq!(client.get_config().treasury, valid_treasury);
 }
+
+// ---------------------------------------------------------------------------
+// FactoryInitialized event (issue #38)
+//
+// The constructor must publish a `FactoryInitialized` event carrying the admin,
+// treasury, fee and group Wasm hash that were frozen into instance storage, so
+// an indexer or auditor can reconstruct the protocol's starting configuration
+// without inferring it from the first FeeUpdated / TreasuryUpdated delta.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn constructor_publishes_factory_initialized_with_full_configuration() {
+    let (env, admin, treasury, client) = setup(MAX_FEE_BPS);
+    let factory_id = client.address.clone();
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    // Capture events emitted by the most recent (and only) call to the contract:
+    // setup() invoked the constructor, so all events belong to FactoryInitialized.
+    let emitted = env.events().all().filter_by_contract(&factory_id);
+
+    let expected = FactoryInitialized {
+        admin,
+        treasury,
+        fee_bps: MAX_FEE_BPS,
+        group_wasm_hash: wasm_hash,
+    }
+    .to_xdr(&env, &factory_id);
+    assert!(
+        emitted.events().contains(&expected),
+        "FactoryInitialized must be emitted from the constructor with the frozen config"
+    );
+}
+
+#[test]
+fn constructor_publishes_factory_initialized_at_a_non_maximum_fee() {
+    // A constructor with a non-protocol-maximum fee must still emit the event
+    // (the issue calls for "the initial configuration event", not "the maximum").
+    let (env, admin, treasury, client) = setup(10);
+    let factory_id = client.address.clone();
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    let emitted = env.events().all().filter_by_contract(&factory_id);
+
+    let expected = FactoryInitialized {
+        admin,
+        treasury,
+        fee_bps: 10,
+        group_wasm_hash: wasm_hash,
+    }
+    .to_xdr(&env, &factory_id);
+    assert!(emitted.events().contains(&expected));
+}
