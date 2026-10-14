@@ -368,18 +368,18 @@ impl GroupContract {
         frequency_seconds: u64,
         fee_bps: u32,
     ) {
+        if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {
+            soroban_sdk::panic_with_error!(&env, GroupError::InvalidMemberCapacity);
+        }
+        if frequency_seconds == 0 {
+            soroban_sdk::panic_with_error!(&env, GroupError::InvalidFrequency);
+        }
         if contribution_amount <= 0
             || contribution_amount
                 .checked_mul(member_capacity as i128)
                 .is_none()
         {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidContributionAmount);
-        }
-        if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {
-            soroban_sdk::panic_with_error!(&env, GroupError::InvalidMemberCapacity);
-        }
-        if frequency_seconds == 0 {
-            soroban_sdk::panic_with_error!(&env, GroupError::InvalidFrequency);
         }
         if treasury == env.current_contract_address() {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidTreasury);
