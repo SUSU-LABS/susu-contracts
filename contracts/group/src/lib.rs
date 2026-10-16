@@ -256,6 +256,10 @@ pub enum GroupError {
     InvalidTreasury = 20,
     /// Token address cannot be the group contract address.
     InvalidToken = 21,
+    /// A `MemberAt` entry for `1..=member_count` was absent — every position
+    /// is written at `join`, so the record archived before its TTL was
+    /// refreshed. Never silently report a shorter order as a smaller group.
+    MemberOrderMissing = 22,
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +744,13 @@ impl GroupContract {
 
     /// The immutable payout order, in join order. Position `n` (1-based) is paid in
     /// round `n`.
-    pub fn get_payout_order(env: Env) -> Vec<Address> {
+    ///
+    /// Every position `1..=member_count` was written at `join`, so a missing
+    /// entry means the record archived before its TTL was refreshed — a
+    /// *storage* anomaly, not a smaller group. Returning the partial Vec would
+    /// let an off-chain consumer mis-read it as a group with fewer members
+    /// (#41): the missing position errors loudly instead.
+    pub fn get_payout_order(env: Env) -> Result<Vec<Address>, GroupError> {
         let count: u32 = env
             .storage()
             .instance()
@@ -750,12 +760,15 @@ impl GroupContract {
         let mut order = Vec::new(&env);
         let mut position = 1u32;
         while position <= count {
-            if let Some(address) = persistent.get(&DataKey::MemberAt(position)) {
-                order.push_back(address);
-            }
+            let key = DataKey::MemberAt(position);
+            let address: Address = persistent
+                .get(&key)
+                .ok_or(GroupError::MemberOrderMissing)?;
+            extend_persistent_ttl(&env, &key);
+            order.push_back(address);
             position += 1;
         }
-        order
+        Ok(order)
     }
 
     /// Observable state of a specific round.
