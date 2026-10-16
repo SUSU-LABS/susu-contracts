@@ -359,6 +359,23 @@ fn create_group_rejects_invalid_parameters() {
         client.try_create_group(&creator, &token, &10_000_000i128, &3u32, &0u64),
         Err(Ok(FactoryError::InvalidFrequency))
     );
+
+    // #35: the most specific error wins even when the inputs trip several
+    // checks — capacity range is validated before the contribution multiply.
+    assert_eq!(
+        client.try_create_group(
+            &creator,
+            &token,
+            &i128::MAX,
+            &(MAX_MEMBERS + 1),
+            &604_800u64
+        ),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &0i128, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity))
+    );
     assert_eq!(
         client.try_create_group(
             &creator,
