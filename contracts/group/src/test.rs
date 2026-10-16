@@ -1326,6 +1326,35 @@ fn get_round_reports_an_unstarted_round_safely() {
 }
 
 #[test]
+fn get_round_hides_recipient_for_future_rounds() {
+    // The doc contract: `None` for a round that does not exist yet. A future
+    // round's MemberAt slot is the *schedule*, not a settled recipient (#39).
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // Round 1 is the current round — its recipient is real.
+    assert_eq!(
+        client.get_round(&1u32).recipient,
+        Some(setup.member(0))
+    );
+    // Rounds 2 and 3 are scheduled, not started — None.
+    assert_eq!(client.get_round(&2u32).recipient, None);
+    assert_eq!(client.get_round(&3u32).recipient, None);
+    // A past round still reports its recipient after paying out.
+    setup.contribute_all(1);
+    client.execute_payout();
+    assert_eq!(
+        client.get_round(&1u32).recipient,
+        Some(setup.member(0))
+    );
+    // And now round 2 is current — its recipient becomes visible.
+    assert_eq!(
+        client.get_round(&2u32).recipient,
+        Some(setup.member(1))
+    );
+}
+
+#[test]
 fn get_pool_balance_is_zero_before_the_group_starts() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
     assert_eq!(setup.client().get_pool_balance(), 0);
