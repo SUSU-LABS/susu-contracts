@@ -12,7 +12,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{storage::Persistent as _, Address as _, Events as _, Ledger as _},
     token, Event, Vec,
 };
 
@@ -1436,4 +1436,47 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         client.try_contribute(&setup.member(0), &setup.amount, &1u32),
         Err(Ok(GroupError::ArithmeticOverflow))
     );
+}
+
+
+#[test]
+fn read_paths_keep_persistent_entries_alive_past_the_threshold() {
+    // #33: after an idle gap past the persistent threshold, the read views
+    // must still refresh the entries they touch — otherwise Member/MemberAt/
+    // RoundPool entries archive and execute_payout fails on a ghost round.
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    setup.contribute_all(1);
+    let client = setup.client();
+
+    // Age the ledger well past the point where an unextended entry dies.
+    setup
+        .env
+        .ledger()
+        .set_sequence_number(PERSISTENT_TTL_THRESHOLD + 10);
+
+    // Every read extends the entries it touches.
+    assert_eq!(client.get_member(&setup.member(0)), 1);
+    assert_eq!(client.get_current_recipient(), setup.member(0));
+    let order = client.get_payout_order();
+    assert_eq!(order.len(), 3);
+    let round = client.get_round(&1u32);
+    assert_eq!(round.contribution_count, 3);
+    assert!(client.get_pool_balance() > 0);
+
+    // The entries the reads touched all carry fresh TTL.
+    let env = &setup.env;
+    let ttl_of = |key: &DataKey| -> u32 {
+        env.as_contract(&setup.group_id, || {
+            env.storage().persistent().get_ttl(key)
+        })
+    };
+    assert!(ttl_of(&DataKey::Member(setup.member(0))) > PERSISTENT_TTL_THRESHOLD);
+    assert!(ttl_of(&DataKey::MemberAt(1)) > PERSISTENT_TTL_THRESHOLD);
+    assert!(ttl_of(&DataKey::RoundPool(1)) > PERSISTENT_TTL_THRESHOLD);
+    assert!(ttl_of(&DataKey::RoundContributionCount(1)) > PERSISTENT_TTL_THRESHOLD);
+
+    // And the payout still executes — the round cannot go missing after the
+    // idle gap.
+    client.execute_payout();
+    assert!(client.get_round(&1u32).payout_executed);
 }
