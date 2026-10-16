@@ -238,6 +238,57 @@ fn constructor_rejects_non_positive_contribution_amount() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn constructor_reports_capacity_error_when_contribution_also_invalid() {
+    // member_capacity = 1 (< MIN_MEMBERS) AND contribution_amount = 0 — the
+    // contribution check used to run first, so this surfaced
+    // InvalidContributionAmount instead of InvalidMemberCapacity (#36).
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            0i128,
+            1u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn constructor_reports_capacity_error_on_zero_capacity() {
+    // capacity 0 fails the range check even when the contribution amount is
+    // valid (#36).
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            10i128,
+            0u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
 #[should_panic]
 fn constructor_rejects_overflowing_pooled_contribution_amount() {
     let env = Env::default();
