@@ -9,7 +9,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _},
+    testutils::{storage::Persistent as _, Address as _, Events as _, Ledger as _},
     Event,
 };
 
@@ -431,4 +431,37 @@ fn set_treasury_rejects_admin_or_factory_address() {
     let valid_treasury = Address::generate(&env);
     assert!(client.try_set_treasury(&valid_treasury).is_ok());
     assert_eq!(client.get_config().treasury, valid_treasury);
+}
+
+#[test]
+fn get_group_extends_the_entrys_persistent_ttl() {
+    // #34: a registry entry only ever read (never re-created) must still not
+    // archive. Seed one directly — create_group's deploy path needs the Group
+    // Wasm and is covered by the wasm-integration suite — then confirm the
+    // read refreshes its persistent TTL.
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let group = Address::generate(&env);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Group(7u32), &group);
+    });
+
+    let before: u32 = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&DataKey::Group(7u32))
+    });
+    assert!(
+        before < PERSISTENT_TTL_EXTEND_TO,
+        "a fresh entry starts below the extend_to window"
+    );
+
+    assert_eq!(client.get_group(&7u32), group);
+
+    let after: u32 = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&DataKey::Group(7u32))
+    });
+    assert!(
+        after > before,
+        "reading the registry must extend the entry's persistent TTL ({before} -> {after})"
+    );
 }
