@@ -49,6 +49,38 @@ fn constructor_stores_configuration() {
 }
 
 #[test]
+fn constructor_publishes_the_initial_configuration() {
+    // The AC asks the deployment to emit the initial config event (#38).
+    // `events().all()` after registration reflects the constructor's
+    // publication — capture before any further call.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    let factory_id = env.register(
+        FactoryContract,
+        (admin.clone(), wasm_hash.clone(), treasury.clone(), MAX_FEE_BPS),
+    );
+
+    let expected = FactoryInitialized {
+        admin: admin.clone(),
+        treasury: treasury.clone(),
+        fee_bps: MAX_FEE_BPS,
+        group_wasm_hash: wasm_hash,
+    }
+    .to_xdr(&env, &factory_id);
+    assert!(
+        env.events()
+            .all()
+            .filter_by_contract(&factory_id)
+            .events()
+            .contains(&expected),
+        "the constructor must publish FactoryInitialized"
+    );
+}
+
+#[test]
 #[should_panic]
 fn constructor_rejects_fee_above_the_protocol_maximum() {
     setup(MAX_FEE_BPS + 1);
