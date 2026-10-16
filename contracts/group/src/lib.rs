@@ -764,17 +764,27 @@ impl GroupContract {
         let payout_executed: bool = persistent
             .get(&DataKey::PayoutExecuted(round))
             .unwrap_or(false);
-        let recipient: Option<Address> = persistent.get(&DataKey::MemberAt(round));
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        // The doc contract is "None for a round that does not exist yet" —
+        // a future round's MemberAt slot is a *schedule*, not a settled
+        // recipient: the order can shift before it plays out. Only a round
+        // at-or-before the current pointer (or one that already paid) has a
+        // real recipient (#39).
+        let recipient: Option<Address> =
+            if round <= current_round || payout_executed {
+                persistent.get(&DataKey::MemberAt(round))
+            } else {
+                None
+            };
 
         // A round that has not started yet reports its phase as waiting.
         let phase = if payout_executed {
             RoundPhase::PayoutExecuted
         } else {
-            let current_round: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::CurrentRound)
-                .unwrap_or(0);
             if round == current_round {
                 env.storage()
                     .instance()
