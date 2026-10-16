@@ -1314,6 +1314,29 @@ fn persistent_entries_survive_past_threshold_via_read_path() {
 }
 
 #[test]
+fn get_payout_order_fails_loudly_on_a_missing_position() {
+    // An archived MemberAt entry must not silently shorten the order (#41) —
+    // simulate it by deleting position 2 directly, then the read errors with
+    // MemberOrderMissing instead of returning 2 members of a 3-member group.
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    setup.join_all();
+    let client = setup.client();
+
+    setup.env.as_contract(&setup.group_id, || {
+        setup
+            .env
+            .storage()
+            .persistent()
+            .remove(&DataKey::MemberAt(2u32));
+    });
+
+    assert_eq!(
+        client.try_get_payout_order(),
+        Err(Ok(GroupError::MemberOrderMissing))
+    );
+}
+
+#[test]
 fn get_round_reports_an_unstarted_round_safely() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
     let round = setup.client().get_round(&5u32);
