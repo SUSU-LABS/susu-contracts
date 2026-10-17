@@ -284,8 +284,8 @@ to filter by them.
 | Event | Topics | Data |
 |---|---|---|
 | `GroupCreated` | `susu`, `group_created`, `creator`, `group` | `group_id`, `token`, `contribution_amount`, `member_capacity`, `fee_bps`, `treasury`, `frequency_seconds` |
-| `FeeUpdated` | `susu`, `fee_updated` | `fee_bps` |
-| `TreasuryUpdated` | `susu`, `treasury_updated`, `treasury` | — |
+| `FeeUpdated` | `susu`, `fee_updated` | `previous_fee_bps`, `fee_bps` |
+| `TreasuryUpdated` | `susu`, `treasury_updated`, `treasury` | `previous_treasury` |
 | `PauseUpdated` | `susu`, `pause_updated` | `paused` |
 
 **Group**
