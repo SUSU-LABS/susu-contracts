@@ -432,3 +432,63 @@ fn set_treasury_rejects_admin_or_factory_address() {
     assert!(client.try_set_treasury(&valid_treasury).is_ok());
     assert_eq!(client.get_config().treasury, valid_treasury);
 }
+
+// ---------------------------------------------------------------------------
+// Registry TTL
+// ---------------------------------------------------------------------------
+
+/// Reads the persistent TTL of a registry entry.
+fn registry_ttl(env: &Env, client: &FactoryContractClient, group_id: u32) -> u32 {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Group(group_id))
+    })
+}
+
+#[test]
+fn get_group_extends_ttl_on_read() {
+    use soroban_sdk::testutils::Deployer as _;
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+
+    let group_id = 1u32;
+    let group_address = Address::generate(&env);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Group(group_id), &group_address);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Group(group_id),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    });
+    let written_at = env.ledger().sequence();
+
+    // Advance until remaining TTL drops below threshold
+    env.ledger()
+        .set_sequence_number(written_at + PERSISTENT_TTL_EXTEND_TO - PERSISTENT_TTL_THRESHOLD + 1);
+    assert!(
+        registry_ttl(&env, &client, group_id) < PERSISTENT_TTL_THRESHOLD,
+        "entry should drop below threshold"
+    );
+
+    // Reading the group extends both instance TTL and persistent TTL
+    assert_eq!(client.get_group(&group_id), group_address);
+    assert_eq!(
+        registry_ttl(&env, &client, group_id),
+        PERSISTENT_TTL_EXTEND_TO,
+        "get_group did not extend the registry entry's persistent TTL"
+    );
+    let instance_ttl = env.deployer().get_contract_instance_ttl(&client.address);
+    assert!(
+        instance_ttl > INSTANCE_TTL_THRESHOLD,
+        "get_group must extend the Factory instance TTL"
+    );
+
+    // Advance past original write-time expiry: entry remains available
+    env.ledger()
+        .set_sequence_number(written_at + PERSISTENT_TTL_EXTEND_TO + 1);
+    assert_eq!(client.get_group(&group_id), group_address);
+}
