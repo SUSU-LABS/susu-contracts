@@ -37,7 +37,25 @@ fn setup(fee_bps: u32) -> (Env, Address, Address, FactoryContractClient<'static>
 
 #[test]
 fn constructor_stores_configuration() {
-    let (_, admin, treasury, client) = setup(MAX_FEE_BPS);
+    let (env, admin, treasury, client) = setup(MAX_FEE_BPS);
+
+    let emitted = env.events().all().filter_by_contract(&client.address);
+    let expected = FactoryInitialized {
+        admin: admin.clone(),
+        treasury: treasury.clone(),
+        fee_bps: MAX_FEE_BPS,
+        group_wasm_hash: BytesN::from_array(&env, &[7u8; 32]),
+    }
+    .to_xdr(&env, &client.address);
+    assert_eq!(
+        emitted
+            .events()
+            .iter()
+            .filter(|event| **event == expected)
+            .count(),
+        1,
+        "the constructor must publish exactly one FactoryInitialized event"
+    );
 
     let config = client.get_config();
     assert_eq!(config.admin, admin);
@@ -46,6 +64,21 @@ fn constructor_stores_configuration() {
     assert!(!config.paused, "a new Factory is not paused");
     assert_eq!(client.get_group_count(), 0);
     assert_eq!(client.version(), 3);
+}
+
+#[test]
+fn constructor_publishes_factory_initialized_at_custom_fee() {
+    let (env, admin, treasury, client) = setup(25);
+    let emitted = env.events().all().filter_by_contract(&client.address);
+
+    let expected = FactoryInitialized {
+        admin,
+        treasury,
+        fee_bps: 25,
+        group_wasm_hash: BytesN::from_array(&env, &[7u8; 32]),
+    }
+    .to_xdr(&env, &client.address);
+    assert!(emitted.events().contains(&expected));
 }
 
 #[test]
