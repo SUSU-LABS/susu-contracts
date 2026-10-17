@@ -376,6 +376,98 @@ fn constructor_rejects_capacity_above_the_maximum() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn constructor_rejects_zero_capacity_even_with_overflowing_contribution_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            0u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn constructor_rejects_sub_minimum_capacity_even_with_overflowing_contribution_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            1u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn constructor_rejects_excess_capacity_even_with_overflowing_contribution_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            MAX_MEMBERS + 1,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_zero_frequency_even_with_overflowing_contribution_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            3u32,
+            0u64,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
 fn constructor_accepts_the_capacity_boundaries() {
     // MIN_MEMBERS is the smallest valid group.
     let smallest = setup(MIN_MEMBERS, ONE_USDC, MAX_FEE_BPS);
